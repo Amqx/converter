@@ -29,7 +29,7 @@ message BackupManga {
   repeated BackupChapter chapters = 16;
   repeated int64 categories = 17;
   repeated BackupTracking tracking = 18;
-  optional bool favorite = 100;
+  optional bool favorite = 100 [default = true];
   optional int32 chapterFlags = 101;
   optional int32 viewer_flags = 103;
   repeated BackupHistory history = 104;

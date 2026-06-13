@@ -1,6 +1,4 @@
-use super::{
-    Result, Backup, BackupReader, BackupWriter,
-};
+use super::{Backup, BackupReader, BackupWriter, Result};
 use crate::matching::Matcher;
 
 pub struct AidokuConverter;

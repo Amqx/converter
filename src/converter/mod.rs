@@ -1,7 +1,7 @@
 use crate::matching::{Matcher, SourceData, SourceId};
 
-pub mod tachiyomi;
 pub mod aidoku;
+pub mod tachiyomi;
 
 pub struct Backup {
     pub manga: Vec<Manga>,
