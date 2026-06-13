@@ -119,6 +119,10 @@ impl Matcher {
         self.sources.push(source);
     }
 
+    pub fn list_sources(&self) -> Vec<SourceId> {
+        self.sources.iter().map(|s| s.id()).collect()
+    }
+
     pub fn find_matches(&self, query: &SourceData) -> Result<Vec<SourceData>> {
         let mut all_results = Vec::new();
 
