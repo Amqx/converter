@@ -2,7 +2,7 @@ use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
     Result,
 };
-use crate::matching::{Matcher, SourceData, SourceId};
+use crate::matching::{Matcher, SourceData, SourceId, SourceRepo};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,7 @@ const BLACKLISTED_SOURCE_IDS: &[i64] = &[
 struct TachiyomiSource {
     id: i64,
     name: Option<String>,
+    repo: Option<SourceRepo>,
 }
 
 impl BackupReader for TachiyomiConverter {
@@ -73,6 +74,8 @@ impl BackupWriter for TachiyomiConverter {
     fn write_backup(&self, backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
         let mut source_ids = HashSet::new();
         let mut backup_sources = Vec::new();
+        let mut repo_base_urls = HashSet::new();
+        let mut backup_extension_repo = Vec::new();
         let category_ids = category_ids_by_name(&backup.categories);
 
         let mut failed_sources = HashSet::new();
@@ -111,6 +114,11 @@ impl BackupWriter for TachiyomiConverter {
                     source_id: tachiyomi_source.id,
                 });
             }
+            if let Some(repo) = tachiyomi_source.repo.as_ref()
+                && repo_base_urls.insert(repo.base_url.clone())
+            {
+                backup_extension_repo.push(repo_to_proto(repo));
+            }
 
             backup_manga.push(manga_to_proto(manga, tachiyomi_source.id, &category_ids));
         }
@@ -128,7 +136,7 @@ impl BackupWriter for TachiyomiConverter {
             backup_sources,
             backup_preferences: Vec::new(),
             backup_source_preferences: Vec::new(),
-            backup_extension_repo: Vec::new(),
+            backup_extension_repo,
             backup_saved_searches: Vec::new(),
         };
 
@@ -212,6 +220,7 @@ fn manga_to_ir(
             external_id: Some(manga.source.to_string()),
             url: None,
             lang: None,
+            repo: None,
         },
         title: manga
             .custom_title
@@ -305,6 +314,7 @@ fn tachiyomi_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<Tachiy
         return Ok(TachiyomiSource {
             id: parse_source_id(&manga.source, &manga.title)?,
             name: manga.source.name.clone(),
+            repo: manga.source.repo.clone(),
         });
     }
 
@@ -318,6 +328,7 @@ fn tachiyomi_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<Tachiy
             Some(TachiyomiSource {
                 id,
                 name: source.name,
+                repo: source.repo,
             })
         })
         .ok_or_else(|| {
@@ -343,6 +354,16 @@ fn parse_source_id(source: &SourceData, manga_title: &str) -> Result<i64> {
                 "invalid Tachiyomi source id for {manga_title} ({source:?}): {err}"
             ))
         })
+}
+
+fn repo_to_proto(repo: &SourceRepo) -> proto::BackupExtensionRepos {
+    proto::BackupExtensionRepos {
+        base_url: repo.base_url.clone(),
+        name: repo.name.clone(),
+        short_name: Some(repo.short_name.clone()),
+        website: repo.website.clone(),
+        signing_key_fingerprint: repo.signing_key.clone(),
+    }
 }
 
 fn manga_to_proto(

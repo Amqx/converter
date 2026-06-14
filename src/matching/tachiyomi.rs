@@ -1,5 +1,5 @@
 use super::SourceId::Tachiyomi;
-use super::{Language, Result, Source, SourceData, SourceId, normalized_key};
+use super::{Language, Result, Source, SourceData, SourceId, SourceRepo, normalized_key};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -23,13 +23,14 @@ impl fmt::Display for TachiyomiEntry {
 }
 
 impl TachiyomiEntry {
-    fn to_source_data(&self) -> SourceData {
+    fn to_source_data(&self, repo: Option<SourceRepo>) -> SourceData {
         SourceData {
             source: Tachiyomi,
             name: Some(self.name.clone()),
             external_id: Some(self.id.to_string()),
             url: Some(self.url.clone()),
             lang: Some(self.lang),
+            repo,
         }
     }
 }
@@ -62,14 +63,26 @@ struct TachiyomiRepoMeta {
     signing_key: String,
 }
 
-#[derive(Debug, Default)]
- pub struct TachiyomiRepoInfo {
-     base_url: String,
-     name: String,
-     short_name: String,
-     website: String,
-     signing_key: String,
- }
+#[derive(Clone, Debug, Default)]
+pub struct TachiyomiRepoInfo {
+    base_url: String,
+    name: String,
+    short_name: String,
+    website: String,
+    signing_key: String,
+}
+
+impl TachiyomiRepoInfo {
+    fn to_source_repo(&self) -> Option<SourceRepo> {
+        (!self.base_url.is_empty()).then(|| SourceRepo {
+            base_url: self.base_url.clone(),
+            name: self.name.clone(),
+            short_name: self.short_name.clone(),
+            website: self.website.clone(),
+            signing_key: self.signing_key.clone(),
+        })
+    }
+}
 
 pub struct TachiyomiExtensionRepo {
     info: TachiyomiRepoInfo,
@@ -195,9 +208,10 @@ impl TachiyomiExtensionRepo {
         seen_ids: &mut HashSet<i64>,
         entries: &[TachiyomiEntry],
         indexes: &[usize],
+        repo: Option<&SourceRepo>,
     ) {
         for idx in indexes {
-            Self::push_entry(results, seen_ids, &entries[*idx]);
+            Self::push_entry(results, seen_ids, &entries[*idx], repo);
         }
     }
 
@@ -205,12 +219,13 @@ impl TachiyomiExtensionRepo {
         results: &mut Vec<SourceData>,
         seen_ids: &mut HashSet<i64>,
         entry: &TachiyomiEntry,
+        repo: Option<&SourceRepo>,
     ) {
         if !seen_ids.insert(entry.id) {
             return;
         }
 
-        results.push(entry.to_source_data());
+        results.push(entry.to_source_data(repo.cloned()));
     }
 }
 
@@ -222,11 +237,18 @@ impl Source for TachiyomiExtensionRepo {
     fn search(&self, query: &SourceData) -> Result<Vec<SourceData>> {
         let mut results = Vec::new();
         let mut seen_ids = HashSet::new();
+        let repo = self.info.to_source_repo();
 
         if let Some(url) = &query.url
             && let Some(indexes) = self.by_url.get(&normalized_key(url))
         {
-            Self::push_entry_indexes(&mut results, &mut seen_ids, &self.entries, indexes);
+            Self::push_entry_indexes(
+                &mut results,
+                &mut seen_ids,
+                &self.entries,
+                indexes,
+                repo.as_ref(),
+            );
         }
 
         if let Some(external_id) = &query.external_id
@@ -234,13 +256,19 @@ impl Source for TachiyomiExtensionRepo {
             && let Some(idx) = self.by_id.get(&id)
         {
             let entry = &self.entries[*idx];
-            Self::push_entry(&mut results, &mut seen_ids, entry);
+            Self::push_entry(&mut results, &mut seen_ids, entry, repo.as_ref());
         }
 
         if let Some(name) = &query.name
             && let Some(indexes) = self.by_name.get(&normalized_key(name))
         {
-            Self::push_entry_indexes(&mut results, &mut seen_ids, &self.entries, indexes);
+            Self::push_entry_indexes(
+                &mut results,
+                &mut seen_ids,
+                &self.entries,
+                indexes,
+                repo.as_ref(),
+            );
         }
 
         Ok(results)
@@ -254,7 +282,10 @@ mod tests {
     #[test]
     fn load_multiple_repos() {
         let keiyoushi = TachiyomiExtensionRepo::default().unwrap();
-        let yuzono = TachiyomiExtensionRepo::new("https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json").unwrap();
+        let yuzono = TachiyomiExtensionRepo::new(
+            "https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json",
+        )
+        .unwrap();
 
         println!("Keiyoushi info: {:?}", keiyoushi.info());
         println!("Yuzono info: {:?}", yuzono.info());
@@ -264,7 +295,8 @@ mod tests {
             name: Some("MangaPill".into()),
             external_id: Some("en.mangapill".into()),
             url: Some("https://mangapill.com".into()),
-            lang: Some(Language::from_code("en".into()))
+            lang: Some(Language::from_code("en")),
+            repo: None,
         };
 
         let keiyoushi_response = keiyoushi.search(&query).unwrap();

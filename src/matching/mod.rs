@@ -67,13 +67,23 @@ impl fmt::Display for Language {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRepo {
+    pub base_url: String,
+    pub name: String,
+    pub short_name: String,
+    pub website: String,
+    pub signing_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceData {
     pub source: SourceId,
     pub name: Option<String>,
     pub external_id: Option<String>,
     pub url: Option<String>,
     pub lang: Option<Language>,
+    pub repo: Option<SourceRepo>,
 }
 
 impl SourceData {
@@ -84,6 +94,7 @@ impl SourceData {
             external_id: None,
             url: None,
             lang: None,
+            repo: None,
         }
     }
 }

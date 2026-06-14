@@ -30,6 +30,7 @@ impl AidokuEntry {
             external_id: Some(self.id.clone()),
             url: Some(self.url.clone()),
             lang: Some(self.lang),
+            repo: None,
         }
     }
 }
@@ -190,14 +191,17 @@ mod tests {
     #[test]
     fn load_multiple_lists() {
         let amqx = AidokuSourceList::default().unwrap();
-        let community = AidokuSourceList::new("https://aidoku-community.github.io/sources/index.min.json").unwrap();
+        let community =
+            AidokuSourceList::new("https://aidoku-community.github.io/sources/index.min.json")
+                .unwrap();
 
-        let query = SourceData{
+        let query = SourceData {
             source: SourceId::Tachiyomi,
             name: Some("MangaDex".into()),
             external_id: Some("2499283573021220255".into()),
             url: Some("https://mangadex.org".into()),
-            lang: Some(Language::All)
+            lang: Some(Language::All),
+            repo: None,
         };
 
         let amqx_response = amqx.search(&query).unwrap();
