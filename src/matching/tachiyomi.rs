@@ -1,6 +1,3 @@
-// Sources:
-// 1: Keiyoushi's official repo (https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json)
-
 use super::SourceId::Tachiyomi;
 use super::{Language, Result, Source, SourceData, SourceId, normalized_key};
 use reqwest::blocking::Client;
@@ -52,7 +49,31 @@ struct TachiyomiIndexSource {
     base_url: String,
 }
 
-pub struct Keiyoushi {
+#[derive(Deserialize, Debug)]
+struct TachiyomiRepoJson {
+    meta: TachiyomiRepoMeta,
+}
+
+#[derive(Deserialize, Debug)]
+struct TachiyomiRepoMeta {
+    name: String,
+    website: String,
+    #[serde(rename = "signingKeyFingerprint")]
+    signing_key: String,
+}
+
+#[derive(Debug, Default)]
+ pub struct TachiyomiRepoInfo {
+     base_url: String,
+     name: String,
+     short_name: String,
+     website: String,
+     signing_key: String,
+ }
+
+pub struct TachiyomiExtensionRepo {
+    info: TachiyomiRepoInfo,
+    index_url: String,
     entries: Vec<TachiyomiEntry>,
 
     by_name: HashMap<String, Vec<usize>>,
@@ -60,19 +81,19 @@ pub struct Keiyoushi {
     by_id: HashMap<i64, usize>,
 }
 
-impl Keiyoushi {
+impl TachiyomiExtensionRepo {
     const ID: SourceId = Tachiyomi;
-    const INDEX_URL: &str =
-        "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
 
-    pub fn new() -> Result<Self> {
-        let mut s = Self::empty();
+    pub fn new(index_url: impl Into<String>) -> Result<Self> {
+        let mut s = Self::empty(index_url);
         s.get()?;
         Ok(s)
     }
 
-    fn empty() -> Self {
+    fn empty(index_url: impl Into<String>) -> Self {
         Self {
+            info: TachiyomiRepoInfo::default(),
+            index_url: index_url.into(),
             entries: Vec::new(),
             by_name: HashMap::new(),
             by_url: HashMap::new(),
@@ -80,13 +101,26 @@ impl Keiyoushi {
         }
     }
 
+    pub fn default() -> Result<Self> {
+        pub const KEIYOUSHI_INDEX_URL: &str =
+            "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
+
+        TachiyomiExtensionRepo::new(KEIYOUSHI_INDEX_URL)
+    }
+
+    pub fn info(&self) -> &TachiyomiRepoInfo {
+        &self.info
+    }
+
     fn get(&mut self) -> Result<()> {
         let client = Client::builder()
             .user_agent("Tachiyomi-Source-Fetcher")
             .build()?;
 
+        self.get_repo_info(&client)?;
+
         let sources: Vec<TachiyomiIndex> = client
-            .get(Self::INDEX_URL)
+            .get(&self.index_url)
             .send()?
             .error_for_status()?
             .json()?;
@@ -94,12 +128,32 @@ impl Keiyoushi {
         self.load_indexes(sources)
     }
 
-    fn load_indexes(&mut self, sources: Vec<TachiyomiIndex>) -> Result<()> {
-        self.entries.clear();
-        self.by_name.clear();
-        self.by_url.clear();
-        self.by_id.clear();
+    fn repo_info_url(&self) -> String {
+        self.index_url
+            .rsplit_once('/')
+            .map(|(base, _)| format!("{base}/repo.json"))
+            .unwrap_or_else(|| "repo.json".to_string())
+    }
 
+    fn get_repo_info(&mut self, client: &Client) -> Result<()> {
+        let repo: TachiyomiRepoJson = client
+            .get(self.repo_info_url())
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        self.info = TachiyomiRepoInfo {
+            base_url: self.index_url.clone(),
+            short_name: normalized_key(&repo.meta.name),
+            name: repo.meta.name,
+            website: repo.meta.website,
+            signing_key: repo.meta.signing_key,
+        };
+
+        Ok(())
+    }
+
+    fn load_indexes(&mut self, sources: Vec<TachiyomiIndex>) -> Result<()> {
         for extension in sources {
             let extension_lang = extension.lang.as_deref().map(Language::from_code);
 
@@ -160,7 +214,7 @@ impl Keiyoushi {
     }
 }
 
-impl Source for Keiyoushi {
+impl Source for TachiyomiExtensionRepo {
     fn id(&self) -> SourceId {
         Self::ID
     }
@@ -190,5 +244,33 @@ impl Source for Keiyoushi {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_multiple_repos() {
+        let keiyoushi = TachiyomiExtensionRepo::default().unwrap();
+        let yuzono = TachiyomiExtensionRepo::new("https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json").unwrap();
+
+        println!("Keiyoushi info: {:?}", keiyoushi.info());
+        println!("Yuzono info: {:?}", yuzono.info());
+
+        let query = SourceData {
+            source: SourceId::Aidoku,
+            name: Some("MangaPill".into()),
+            external_id: Some("en.mangapill".into()),
+            url: Some("https://mangapill.com".into()),
+            lang: Some(Language::from_code("en".into()))
+        };
+
+        let keiyoushi_response = keiyoushi.search(&query).unwrap();
+        let yuzono_response = yuzono.search(&query).unwrap();
+
+        println!("Keiyoushi result: {:?}", keiyoushi_response);
+        println!("Yuzono result: {:?}", yuzono_response);
     }
 }
