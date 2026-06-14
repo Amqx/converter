@@ -1,6 +1,3 @@
-// Sources:
-// 1: Amqx source index (https://amqx.github.io/sources/index.min.json)
-
 use super::SourceId::Aidoku;
 use super::{Language, Result, Source, SourceData, SourceId, normalized_key};
 use reqwest::blocking::Client;
@@ -53,7 +50,8 @@ struct AidokuIndexSource {
     base_url: String,
 }
 
-pub struct AmqxGit {
+pub struct AidokuSourceList {
+    index_url: String,
     entries: Vec<AidokuEntry>,
 
     by_name: HashMap<String, Vec<usize>>,
@@ -61,18 +59,23 @@ pub struct AmqxGit {
     by_id: HashMap<String, Vec<usize>>,
 }
 
-impl AmqxGit {
+impl AidokuSourceList {
     const ID: SourceId = Aidoku;
-    const INDEX_URL: &str = "https://amqx.github.io/sources/index.min.json";
 
-    pub fn new() -> Result<Self> {
-        let mut s = Self::empty();
+    pub fn new(index_url: impl Into<String>) -> Result<Self> {
+        let mut s = Self::empty(index_url);
         s.get()?;
         Ok(s)
     }
 
-    fn empty() -> Self {
+    pub fn default() -> Result<Self> {
+        const AMQX_SOURCE_LIST_URL: &str = "https://amqx.github.io/sources/index.min.json";
+        Self::new(AMQX_SOURCE_LIST_URL)
+    }
+
+    fn empty(index_url: impl Into<String>) -> Self {
         Self {
+            index_url: index_url.into(),
             entries: Vec::new(),
             by_name: HashMap::new(),
             by_url: HashMap::new(),
@@ -86,21 +89,16 @@ impl AmqxGit {
             .build()?;
 
         let index: AidokuIndex = client
-            .get(Self::INDEX_URL)
+            .get(&self.index_url)
             .send()?
             .error_for_status()?
             .json()?;
 
-        self.load_index(index);
+        self.load_indexes(index);
         Ok(())
     }
 
-    fn load_index(&mut self, index: AidokuIndex) {
-        self.entries.clear();
-        self.by_name.clear();
-        self.by_url.clear();
-        self.by_id.clear();
-
+    fn load_indexes(&mut self, index: AidokuIndex) {
         for source in index.sources {
             let languages = if source.languages.is_empty() {
                 vec![Language::All]
@@ -154,7 +152,7 @@ impl AmqxGit {
     }
 }
 
-impl Source for AmqxGit {
+impl Source for AidokuSourceList {
     fn id(&self) -> SourceId {
         Self::ID
     }
@@ -182,5 +180,30 @@ impl Source for AmqxGit {
         }
 
         Ok(matches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_multiple_lists() {
+        let amqx = AidokuSourceList::default().unwrap();
+        let community = AidokuSourceList::new("https://aidoku-community.github.io/sources/index.min.json").unwrap();
+
+        let query = SourceData{
+            source: SourceId::Tachiyomi,
+            name: Some("MangaDex".into()),
+            external_id: Some("2499283573021220255".into()),
+            url: Some("https://mangadex.org".into()),
+            lang: Some(Language::All)
+        };
+
+        let amqx_response = amqx.search(&query).unwrap();
+        let community_response = community.search(&query).unwrap();
+
+        println!("Amqx result: {:?}", amqx_response);
+        println!("Community result: {:?}", community_response);
     }
 }
