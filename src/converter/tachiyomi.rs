@@ -7,7 +7,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use tracing::warn;
+use tracing::{debug, info, trace, warn};
 
 pub struct TachiyomiConverter;
 
@@ -64,14 +64,19 @@ impl BackupReader for TachiyomiConverter {
 
         Ok(Backup {
             manga,
-            categories,
-            format: SourceId::Tachiyomi,
+            categories
         })
     }
 }
 
 impl BackupWriter for TachiyomiConverter {
     fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+        debug!(
+            manga = backup.manga.len(),
+            categories = backup.categories.len(),
+            "Building Tachiyomi backup"
+        );
+
         let mut source_ids = HashSet::new();
         let mut backup_sources = Vec::new();
         let mut repo_base_urls = HashSet::new();
@@ -80,16 +85,24 @@ impl BackupWriter for TachiyomiConverter {
 
         let mut failed_sources = HashSet::new();
         let mut backup_manga = Vec::new();
+        let mut skipped_manga = 0usize;
         for manga in &backup.manga {
+            trace!(
+                title = %manga.title,
+                chapters = manga.chapters.len(),
+                history_entries = manga.history.len(),
+                "Converting manga to Tachiyomi"
+            );
             let source_key = (
                 manga.source.source,
                 manga.source.external_id.clone(),
                 manga.source.name.clone(),
             );
             if failed_sources.contains(&source_key) {
+                skipped_manga += 1;
                 warn!(
                     title = %manga.title,
-                    ?source_key,
+                    source = source_key.2,
                     "skipping manga because its source previously failed to match"
                 );
                 continue;
@@ -97,9 +110,10 @@ impl BackupWriter for TachiyomiConverter {
             let tachiyomi_source = match tachiyomi_source_for_manga(manga, matcher) {
                 Ok(source) => source,
                 Err(err) => {
+                    skipped_manga += 1;
                     warn!(
                         title = %manga.title,
-                        ?source_key,
+                        source = source_key.2,
                         error = %err,
                         "failed to match source; skipping this and subsequent manga from the same source"
                     );
@@ -124,12 +138,19 @@ impl BackupWriter for TachiyomiConverter {
             backup_manga.push(manga_to_proto(manga, tachiyomi_source.id, &category_ids));
         }
 
-        let backup_categories = backup
+        let backup_categories: Vec<_> = backup
             .categories
             .iter()
             .enumerate()
             .map(category_to_proto)
             .collect();
+        info!(
+            converted_manga = backup_manga.len(),
+            skipped_manga,
+            sources = backup_sources.len(),
+            extension_repos = backup_extension_repo.len(),
+            "Finished building Tachiyomi backup data"
+        );
 
         let proto_backup = proto::Backup {
             backup_manga,
@@ -141,7 +162,9 @@ impl BackupWriter for TachiyomiConverter {
             backup_saved_searches: Vec::new(),
         };
 
-        encode(&proto_backup)
+        let bytes = encode(&proto_backup)?;
+        debug!(bytes = bytes.len(), "Finished serializing Tachiyomi backup");
+        Ok(bytes)
     }
 }
 
@@ -261,13 +284,13 @@ fn chapter_to_ir(chapter: proto::BackupChapter) -> Chapter {
         scanlator: chapter.scanlator.unwrap_or_default(),
         date_fetched: chapter.date_fetch.unwrap_or_default(),
         date_uploaded: chapter.date_upload.unwrap_or_default(),
-        chapter_number: chapter.chapter_number.unwrap_or_default() as f64,
+        chapter_number: f64::from(chapter.chapter_number.unwrap_or_default()),
         last_modified: chapter.last_modified_at.unwrap_or_default(),
         read: chapter.read.unwrap_or_default(),
         last_page_read: chapter
             .last_page_read
             .unwrap_or_default()
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
     }
 }
 
@@ -423,10 +446,10 @@ fn chapter_to_proto(chapter: &Chapter) -> proto::BackupChapter {
     proto::BackupChapter {
         url: chapter.id.clone(),
         name: chapter.title.clone(),
-        scanlator: (!chapter.scanlator.is_empty()).then(|| chapter.scanlator.to_owned()),
+        scanlator: (!chapter.scanlator.is_empty()).then(|| chapter.scanlator.clone()),
         read: Some(chapter.read),
         bookmark: None,
-        last_page_read: Some(chapter.last_page_read as i64),
+        last_page_read: Some(i64::from(chapter.last_page_read)),
         date_fetch: Some(chapter.date_fetched),
         date_upload: Some(chapter.date_uploaded),
         chapter_number: Some(chapter.chapter_number as f32),

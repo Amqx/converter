@@ -1,14 +1,12 @@
-use std::fmt;
 use clap::ValueEnum;
+use std::fmt;
+use tracing::{debug, trace};
 
 pub mod aidoku;
 pub mod tachiyomi;
 
 #[derive(thiserror::Error, Debug)]
 pub enum MatcherError {
-    #[error("Source error {0}: {1}")]
-    SourceError(SourceId, String),
-
     #[error("Network error")]
     Network(#[from] reqwest::Error),
 
@@ -87,19 +85,6 @@ pub struct SourceData {
     pub repo: Option<SourceRepo>,
 }
 
-impl SourceData {
-    pub fn new(source: SourceId) -> Self {
-        Self {
-            source,
-            name: None,
-            external_id: None,
-            url: None,
-            lang: None,
-            repo: None,
-        }
-    }
-}
-
 pub(super) fn normalized_key(value: &str) -> String {
     value.to_lowercase()
 }
@@ -131,20 +116,38 @@ impl Matcher {
         self.sources.push(source);
     }
 
-    pub fn list_sources(&self) -> Vec<SourceId> {
-        self.sources.iter().map(|s| s.id()).collect()
-    }
-
     pub fn find_matches(&self, query: &SourceData) -> Result<Vec<SourceData>> {
         let mut all_results = Vec::new();
 
+        debug!(
+            query_source = ?query.source,
+            query_name = ?query.name,
+            query_external_id = ?query.external_id,
+            query_url = ?query.url,
+            registered_sources = self.sources.len(),
+            "Searching for matching sources"
+        );
+
         for source in &self.sources {
             if query.source == source.id() {
+                trace!(
+                    source = ?source.id(),
+                    "Skipping matcher source because it matches the query source"
+                );
                 continue;
             }
-            all_results.extend(source.search(query)?);
+            trace!(source = ?source.id(), "Searching matcher source");
+            let results = source.search(query)?;
+            debug!(
+                source = ?source.id(),
+                matches = results.len(),
+                "Matcher source returned results"
+            );
+            trace!(source = ?source.id(), ?results, "Matcher source result details");
+            all_results.extend(results);
         }
 
+        debug!(matches = all_results.len(), "Finished source matching");
         Ok(all_results)
     }
 }

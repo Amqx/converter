@@ -215,7 +215,7 @@ mod tests {
         let amqx_response = amqx.search(&query).unwrap();
         let community_response = community.search(&query).unwrap();
 
-        println!("Amqx result: {:?}", amqx_response);
-        println!("Community result: {:?}", community_response);
+        println!("Amqx result: {amqx_response:?}");
+        println!("Community result: {community_response:?}");
     }
 }

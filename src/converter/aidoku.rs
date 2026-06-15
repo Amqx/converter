@@ -8,7 +8,7 @@ use serde_json::{Map, Number, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{debug, info, trace, warn};
 
 pub struct AidokuConverter;
 
@@ -30,9 +30,9 @@ impl BackupReader for AidokuConverter {
     fn read_backup(bytes: &[u8]) -> Result<Backup> {
         let backup = parse_backup_bytes(bytes)?;
         let root = object(&backup, "Aidoku backup root")?;
-        let manga_details = manga_details_by_key(root)?;
-        let chapters = chapters_by_manga(root)?;
-        let histories = history_by_manga(root)?;
+        let manga_details = manga_details_by_key(root);
+        let chapters = chapters_by_manga(root);
+        let histories = history_by_manga(root);
         let latest_history = latest_history_by_chapter(root)?;
 
         let manga = array_field(root, "library")
@@ -50,14 +50,19 @@ impl BackupReader for AidokuConverter {
 
         Ok(Backup {
             manga,
-            categories: categories_to_ir(root),
-            format: SourceId::Aidoku,
+            categories: categories_to_ir(root)
         })
     }
 }
 
 impl BackupWriter for AidokuConverter {
     fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+        debug!(
+            manga = backup.manga.len(),
+            categories = backup.categories.len(),
+            "Building Aidoku backup"
+        );
+
         let mut failed_sources = HashSet::new();
         let mut source_ids = HashSet::new();
         let mut source_list_urls = HashSet::new();
@@ -65,17 +70,25 @@ impl BackupWriter for AidokuConverter {
         let mut manga_items = Vec::new();
         let mut chapter_items = Vec::new();
         let mut history_items = Vec::new();
+        let mut skipped_manga = 0usize;
 
         for manga in &backup.manga {
+            trace!(
+                title = %manga.title,
+                chapters = manga.chapters.len(),
+                history_entries = manga.history.len(),
+                "Converting manga to Aidoku"
+            );
             let source_key = (
                 manga.source.source,
                 manga.source.external_id.clone(),
                 manga.source.name.clone(),
             );
             if failed_sources.contains(&source_key) {
+                skipped_manga += 1;
                 warn!(
                     title = %manga.title,
-                    ?source_key,
+                    source = source_key.2,
                     "skipping manga because its Aidoku source previously failed to match"
                 );
                 continue;
@@ -84,11 +97,12 @@ impl BackupWriter for AidokuConverter {
             let source = match aidoku_source_for_manga(manga, matcher) {
                 Ok(source) => source,
                 Err(err) => {
+                    skipped_manga += 1;
                     warn!(
                         title = %manga.title,
-                        ?source_key,
+                        source = source_key.2,
                         error = %err,
-                        "failed to match Aidoku source; skipping this and subsequent manga from the same source"
+                        "failed to match source; skipping this and subsequent manga from the same source"
                     );
                     failed_sources.insert(source_key);
                     continue;
@@ -104,7 +118,7 @@ impl BackupWriter for AidokuConverter {
             }
 
             source_ids.insert(source_id.clone());
-            library.push(library_entry_to_plist(manga, &source_id)?);
+            library.push(library_entry_to_plist(manga, &source_id));
             manga_items.push(manga_to_plist(manga, &source_id));
 
             let chapters_by_id = manga
@@ -114,12 +128,12 @@ impl BackupWriter for AidokuConverter {
                 .collect::<HashMap<_, _>>();
 
             for (idx, chapter) in manga.chapters.iter().enumerate() {
-                chapter_items.push(chapter_to_plist(chapter, manga, &source_id, idx)?);
+                chapter_items.push(chapter_to_plist(chapter, manga, &source_id, idx));
             }
 
             for history in &manga.history {
                 let chapter = chapters_by_id.get(history.url.as_str()).copied();
-                history_items.push(history_to_plist(history, manga, &source_id, chapter)?);
+                history_items.push(history_to_plist(history, manga, &source_id, chapter));
             }
 
             let history_chapter_ids = manga
@@ -141,7 +155,7 @@ impl BackupWriter for AidokuConverter {
                     manga,
                     &source_id,
                     Some(chapter),
-                )?);
+                ));
             }
         }
 
@@ -149,6 +163,13 @@ impl BackupWriter for AidokuConverter {
         source_ids.sort();
         let mut source_list_urls = source_list_urls.into_iter().collect::<Vec<_>>();
         source_list_urls.sort();
+        info!(
+            converted_manga = library.len(),
+            skipped_manga,
+            sources = source_ids.len(),
+            source_lists = source_list_urls.len(),
+            "Finished building Aidoku backup data"
+        );
 
         let mut root = Dictionary::new();
         root.insert("library".into(), PlistValue::Array(library));
@@ -191,6 +212,7 @@ impl BackupWriter for AidokuConverter {
             .to_writer_binary(&mut bytes)
             .map_err(|err| IRError::Serialize(format!("failed to write Aidoku plist: {err}")))?;
 
+        debug!(bytes = bytes.len(), "Finished serializing Aidoku backup");
         Ok(bytes)
     }
 }
@@ -227,18 +249,15 @@ fn plist_to_json(value: PlistValue) -> JsonValue {
                 .collect(),
         ),
         PlistValue::Boolean(value) => JsonValue::Bool(value),
-        PlistValue::Data(_) => JsonValue::Null,
         PlistValue::Date(value) => {
             let time: SystemTime = value.into();
             JsonValue::Number(Number::from(system_time_to_millis(time)))
         }
         PlistValue::Integer(value) => value
             .as_signed()
-            .map(|value| JsonValue::Number(Number::from(value)))
-            .unwrap_or(JsonValue::Null),
+            .map_or(JsonValue::Null, |value| JsonValue::Number(Number::from(value))),
         PlistValue::Real(value) => Number::from_f64(value)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
+            .map_or(JsonValue::Null, JsonValue::Number),
         PlistValue::String(value) => JsonValue::String(value),
         PlistValue::Uid(value) => JsonValue::Number(Number::from(value.get())),
         _ => JsonValue::Null,
@@ -278,7 +297,7 @@ fn categories_to_ir(root: &JsonObject) -> Vec<Category> {
         .collect()
 }
 
-fn manga_details_by_key(root: &JsonObject) -> Result<HashMap<MangaKey, &JsonObject>> {
+fn manga_details_by_key(root: &JsonObject) -> HashMap<MangaKey, &JsonObject> {
     let mut details = HashMap::new();
 
     for manga in array_field(root, "manga") {
@@ -287,10 +306,10 @@ fn manga_details_by_key(root: &JsonObject) -> Result<HashMap<MangaKey, &JsonObje
         }
     }
 
-    Ok(details)
+    details
 }
 
-fn chapters_by_manga(root: &JsonObject) -> Result<HashMap<MangaKey, Vec<&JsonObject>>> {
+fn chapters_by_manga(root: &JsonObject) -> HashMap<MangaKey, Vec<&JsonObject>> {
     let mut chapters: HashMap<MangaKey, Vec<&JsonObject>> = HashMap::new();
 
     for chapter in array_field(root, "chapters") {
@@ -299,10 +318,10 @@ fn chapters_by_manga(root: &JsonObject) -> Result<HashMap<MangaKey, Vec<&JsonObj
         }
     }
 
-    Ok(chapters)
+    chapters
 }
 
-fn history_by_manga(root: &JsonObject) -> Result<HashMap<MangaKey, Vec<&JsonObject>>> {
+fn history_by_manga(root: &JsonObject) -> HashMap<MangaKey, Vec<&JsonObject>> {
     let mut histories: HashMap<MangaKey, Vec<&JsonObject>> = HashMap::new();
 
     for history in array_field(root, "history") {
@@ -311,7 +330,7 @@ fn history_by_manga(root: &JsonObject) -> Result<HashMap<MangaKey, Vec<&JsonObje
         }
     }
 
-    Ok(histories)
+    histories
 }
 
 fn latest_history_by_chapter(root: &JsonObject) -> Result<HashMap<ChapterKey, ReadState>> {
@@ -324,7 +343,7 @@ fn latest_history_by_chapter(root: &JsonObject) -> Result<HashMap<ChapterKey, Re
         let last_read = date_millis_field(history, "dateRead").unwrap_or_default();
         let progress = integer_field(history, "progress")
             .unwrap_or_default()
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         let state = ReadState {
             completed: bool_field(history, "completed").unwrap_or_default(),
             progress,
@@ -485,8 +504,7 @@ fn origin_from_url(url: &str) -> Option<String> {
 fn source_name_from_id(source_id: &str) -> String {
     source_id
         .rsplit_once('.')
-        .map(|(_, name)| name)
-        .unwrap_or(source_id)
+        .map_or(source_id, |(_, name)| name)
         .to_owned()
 }
 
@@ -626,19 +644,19 @@ fn parse_rfc3339_millis(value: &str) -> Option<i64> {
     let days = days_from_civil(year, month, day);
     Some(
         days * 86_400_000
-            + hour as i64 * 3_600_000
-            + minute as i64 * 60_000
-            + second as i64 * 1000
-            + millis as i64,
+            + i64::from(hour) * 3_600_000
+            + i64::from(minute) * 60_000
+            + i64::from(second) * 1000
+            + i64::from(millis),
     )
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = year as i64 - i64::from(month <= 2);
+    let year = i64::from(year) - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
-    let month = month as i64;
-    let day = day as i64;
+    let month = i64::from(month);
+    let day = i64::from(day);
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
@@ -696,7 +714,7 @@ fn aidoku_source_id(source: &SourceData, manga_title: &str) -> Result<String> {
     })
 }
 
-fn library_entry_to_plist(manga: &Manga, source_id: &str) -> Result<PlistValue> {
+fn library_entry_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
     let mut entry = Dictionary::new();
     if let Some(date_added) = manga.date_added {
         entry.insert(
@@ -736,7 +754,7 @@ fn library_entry_to_plist(manga: &Manga, source_id: &str) -> Result<PlistValue> 
     entry.insert("mangaId".into(), PlistValue::String(manga.id.clone()));
     entry.insert("sourceId".into(), PlistValue::String(source_id.to_owned()));
 
-    Ok(PlistValue::Dictionary(entry))
+    PlistValue::Dictionary(entry)
 }
 
 fn manga_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
@@ -776,7 +794,7 @@ fn chapter_to_plist(
     manga: &Manga,
     source_id: &str,
     source_order: usize,
-) -> Result<PlistValue> {
+) -> PlistValue {
     let mut item = Dictionary::new();
     item.insert("sourceId".into(), PlistValue::String(source_id.to_owned()));
     item.insert("mangaId".into(), PlistValue::String(manga.id.clone()));
@@ -807,7 +825,7 @@ fn chapter_to_plist(
         PlistValue::Integer((source_order as i64).into()),
     );
 
-    Ok(PlistValue::Dictionary(item))
+    PlistValue::Dictionary(item)
 }
 
 fn history_to_plist(
@@ -815,7 +833,7 @@ fn history_to_plist(
     manga: &Manga,
     source_id: &str,
     chapter: Option<&Chapter>,
-) -> Result<PlistValue> {
+) -> PlistValue {
     let mut item = Dictionary::new();
     item.insert(
         "dateRead".into(),
@@ -828,7 +846,7 @@ fn history_to_plist(
         "progress".into(),
         PlistValue::Integer(
             chapter
-                .map(|chapter| chapter.last_page_read as i64)
+                .map(|chapter| i64::from(chapter.last_page_read))
                 .unwrap_or_default()
                 .into(),
         ),
@@ -837,7 +855,7 @@ fn history_to_plist(
         "total".into(),
         PlistValue::Integer(
             chapter
-                .and_then(|chapter| chapter.read.then_some(chapter.last_page_read as i64))
+                .and_then(|chapter| chapter.read.then_some(i64::from(chapter.last_page_read)))
                 .unwrap_or_default()
                 .into(),
         ),
@@ -847,7 +865,7 @@ fn history_to_plist(
         PlistValue::Boolean(chapter.map(|chapter| chapter.read).unwrap_or_default()),
     );
 
-    Ok(PlistValue::Dictionary(item))
+    PlistValue::Dictionary(item)
 }
 
 fn synthesized_history_time(manga: &Manga, chapter: &Chapter) -> i64 {

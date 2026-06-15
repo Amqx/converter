@@ -121,7 +121,8 @@ impl TachiyomiExtensionRepo {
         TachiyomiExtensionRepo::new(KEIYOUSHI_INDEX_URL)
     }
 
-    pub fn info(&self) -> &TachiyomiRepoInfo {
+    #[cfg(test)]
+    fn info(&self) -> &TachiyomiRepoInfo {
         &self.info
     }
 
@@ -143,9 +144,7 @@ impl TachiyomiExtensionRepo {
 
     fn repo_info_url(&self) -> String {
         self.index_url
-            .rsplit_once('/')
-            .map(|(base, _)| format!("{base}/repo.json"))
-            .unwrap_or_else(|| "repo.json".to_string())
+            .rsplit_once('/').map_or_else(|| "repo.json".to_string(), |(base, _)| format!("{base}/repo.json"))
     }
 
     fn get_repo_info(&mut self, client: &Client) -> Result<()> {
@@ -302,7 +301,7 @@ mod tests {
         let keiyoushi_response = keiyoushi.search(&query).unwrap();
         let yuzono_response = yuzono.search(&query).unwrap();
 
-        println!("Keiyoushi result: {:?}", keiyoushi_response);
-        println!("Yuzono result: {:?}", yuzono_response);
+        println!("Keiyoushi result: {keiyoushi_response:?}");
+        println!("Yuzono result: {yuzono_response:?}");
     }
 }

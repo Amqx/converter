@@ -1,4 +1,4 @@
-use crate::matching::{Matcher, SourceData, SourceId};
+use crate::matching::{Matcher, SourceData};
 
 pub mod aidoku;
 pub mod tachiyomi;
@@ -6,7 +6,25 @@ pub mod tachiyomi;
 pub struct Backup {
     pub manga: Vec<Manga>,
     pub categories: Vec<Category>,
-    pub format: SourceId,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackupStats {
+    pub manga: usize,
+    pub categories: usize,
+    pub chapters: usize,
+    pub history_entries: usize,
+}
+
+impl BackupStats {
+    pub fn from_backup(backup: &Backup) -> Self {
+        Self {
+            manga: backup.manga.len(),
+            categories: backup.categories.len(),
+            chapters: backup.manga.iter().map(|manga| manga.chapters.len()).sum(),
+            history_entries: backup.manga.iter().map(|manga| manga.history.len()).sum(),
+        }
+    }
 }
 
 #[derive(PartialEq, Debug)]
