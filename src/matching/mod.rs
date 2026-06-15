@@ -1,4 +1,5 @@
 use std::fmt;
+use clap::ValueEnum;
 
 pub mod aidoku;
 pub mod tachiyomi;
@@ -22,7 +23,7 @@ pub enum MatcherError {
 }
 pub type Result<T> = std::result::Result<T, MatcherError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum SourceId {
     Aidoku,
     Tachiyomi,

@@ -89,9 +89,9 @@ pub enum IRError {
 pub type Result<T> = std::result::Result<T, IRError>;
 
 pub trait BackupReader {
-    fn read_backup(&self, bytes: &[u8]) -> Result<Backup>;
+    fn read_backup(bytes: &[u8]) -> Result<Backup>;
 }
 
 pub trait BackupWriter {
-    fn write_backup(&self, backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>>;
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>>;
 }

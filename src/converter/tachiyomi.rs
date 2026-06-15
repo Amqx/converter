@@ -30,7 +30,7 @@ struct TachiyomiSource {
 }
 
 impl BackupReader for TachiyomiConverter {
-    fn read_backup(&self, bytes: &[u8]) -> Result<Backup> {
+    fn read_backup(bytes: &[u8]) -> Result<Backup> {
         let bytes = decode(bytes)?;
         let backup = proto::Backup::decode(bytes.as_slice())?;
         let source_names = source_names_by_id(&backup.backup_sources);
@@ -71,7 +71,7 @@ impl BackupReader for TachiyomiConverter {
 }
 
 impl BackupWriter for TachiyomiConverter {
-    fn write_backup(&self, backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
         let mut source_ids = HashSet::new();
         let mut backup_sources = Vec::new();
         let mut repo_base_urls = HashSet::new();

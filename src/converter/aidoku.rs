@@ -27,7 +27,7 @@ struct ReadState {
 }
 
 impl BackupReader for AidokuConverter {
-    fn read_backup(&self, bytes: &[u8]) -> Result<Backup> {
+    fn read_backup(bytes: &[u8]) -> Result<Backup> {
         let backup = parse_backup_bytes(bytes)?;
         let root = object(&backup, "Aidoku backup root")?;
         let manga_details = manga_details_by_key(root)?;
@@ -57,7 +57,7 @@ impl BackupReader for AidokuConverter {
 }
 
 impl BackupWriter for AidokuConverter {
-    fn write_backup(&self, backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
         let mut failed_sources = HashSet::new();
         let mut source_ids = HashSet::new();
         let mut source_list_urls = HashSet::new();
