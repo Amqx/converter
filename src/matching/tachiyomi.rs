@@ -284,7 +284,7 @@ mod tests {
         let yuzono = TachiyomiExtensionRepo::new(
             "https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json",
         )
-        .unwrap();
+            .unwrap();
 
         println!("Keiyoushi info: {:?}", keiyoushi.info());
         println!("Yuzono info: {:?}", yuzono.info());

@@ -63,6 +63,7 @@ impl BackupReader for TachiyomiConverter {
             .collect();
 
         Ok(Backup {
+            source: SourceId::Tachiyomi,
             manga,
             categories
         })

@@ -49,6 +49,7 @@ impl BackupReader for AidokuConverter {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Backup {
+            source: SourceId::Aidoku,
             manga,
             categories: categories_to_ir(root)
         })
@@ -199,9 +200,13 @@ impl BackupWriter for AidokuConverter {
         root.insert("settings".into(), PlistValue::Dictionary(Dictionary::new()));
         root.insert(
             "date".into(),
-            PlistValue::Date(plist_date_from_millis(latest_backup_time(backup))),
+            PlistValue::Date(plist::Date::from(SystemTime::now())),
         );
         root.insert("automatic".into(), PlistValue::Boolean(false));
+        root.insert(
+            "name".into(),
+            PlistValue::String(format!("Converted from {}", backup.source)),
+        );
         root.insert(
             "version".into(),
             PlistValue::String(AIDOKU_BACKUP_VERSION.into()),
@@ -943,21 +948,6 @@ fn aidoku_lang_code(source_id: &str) -> String {
         Some(code) if !code.is_empty() && code != "multi" => code.to_owned(),
         _ => String::new(),
     }
-}
-
-fn latest_backup_time(backup: &Backup) -> i64 {
-    backup
-        .manga
-        .iter()
-        .flat_map(|manga| {
-            manga
-                .date_added
-                .into_iter()
-                .chain(manga.history.iter().map(|history| history.last_read))
-                .chain(manga.chapters.iter().map(|chapter| chapter.date_uploaded))
-        })
-        .max()
-        .unwrap_or_default()
 }
 
 fn plist_date_from_millis(millis: i64) -> plist::Date {

@@ -30,7 +30,7 @@ impl fmt::Display for SourceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SourceId::Aidoku => write!(f, "Aidoku"),
-            SourceId::Tachiyomi => write!(f, "Keiyoushi"),
+            SourceId::Tachiyomi => write!(f, "Tachiyomi"),
         }
     }
 }
