@@ -69,11 +69,11 @@ impl fmt::Display for Language {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRepo {
-    pub base_url: String,
-    pub name: String,
-    pub short_name: String,
-    pub website: String,
-    pub signing_key: String,
+    pub base_url: Option<String>,
+    pub name: Option<String>,
+    pub short_name: Option<String>,
+    pub website: Option<String>,
+    pub signing_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

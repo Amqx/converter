@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 flate2 = "1.1.9"
 isolang = "2.4.0"
+plist = "1.9.0"
 prost = "0.14.4"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }

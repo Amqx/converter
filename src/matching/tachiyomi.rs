@@ -75,11 +75,11 @@ pub struct TachiyomiRepoInfo {
 impl TachiyomiRepoInfo {
     fn to_source_repo(&self) -> Option<SourceRepo> {
         (!self.base_url.is_empty()).then(|| SourceRepo {
-            base_url: self.base_url.clone(),
-            name: self.name.clone(),
-            short_name: self.short_name.clone(),
-            website: self.website.clone(),
-            signing_key: self.signing_key.clone(),
+            base_url: Some(self.base_url.clone()),
+            name: Some(self.name.clone()),
+            short_name: Some(self.short_name.clone()),
+            website: Some(self.website.clone()),
+            signing_key: Some(self.signing_key.clone()),
         })
     }
 }

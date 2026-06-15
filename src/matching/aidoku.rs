@@ -1,5 +1,5 @@
 use super::SourceId::Aidoku;
-use super::{Language, Result, Source, SourceData, SourceId, normalized_key};
+use super::{Language, Result, Source, SourceData, SourceId, SourceRepo, normalized_key};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,7 @@ struct AidokuEntry {
     id: String,
     url: String,
     lang: Language,
+    source_list_url: String,
 }
 impl fmt::Display for AidokuEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -30,7 +31,13 @@ impl AidokuEntry {
             external_id: Some(self.id.clone()),
             url: Some(self.url.clone()),
             lang: Some(self.lang),
-            repo: None,
+            repo: Some(SourceRepo {
+                base_url: Some(self.source_list_url.clone()),
+                name: None,
+                short_name: None,
+                website: None,
+                signing_key: None,
+            }),
         }
     }
 }
@@ -117,6 +124,7 @@ impl AidokuSourceList {
                     id: source.id.clone(),
                     url: source.base_url.clone(),
                     lang,
+                    source_list_url: self.index_url.clone(),
                 });
             }
         }

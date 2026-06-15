@@ -115,7 +115,8 @@ impl BackupWriter for TachiyomiConverter {
                 });
             }
             if let Some(repo) = tachiyomi_source.repo.as_ref()
-                && repo_base_urls.insert(repo.base_url.clone())
+                && let Some(base_url) = repo.base_url.as_ref()
+                && repo_base_urls.insert(base_url.clone())
             {
                 backup_extension_repo.push(repo_to_proto(repo));
             }
@@ -358,11 +359,11 @@ fn parse_source_id(source: &SourceData, manga_title: &str) -> Result<i64> {
 
 fn repo_to_proto(repo: &SourceRepo) -> proto::BackupExtensionRepos {
     proto::BackupExtensionRepos {
-        base_url: repo.base_url.clone(),
-        name: repo.name.clone(),
-        short_name: Some(repo.short_name.clone()),
-        website: repo.website.clone(),
-        signing_key_fingerprint: repo.signing_key.clone(),
+        base_url: repo.base_url.clone().unwrap_or_default(),
+        name: repo.name.clone().unwrap_or_default(),
+        short_name: repo.short_name.clone(),
+        website: repo.website.clone().unwrap_or_default(),
+        signing_key_fingerprint: repo.signing_key.clone().unwrap_or_default(),
     }
 }
 
