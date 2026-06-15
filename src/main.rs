@@ -5,6 +5,9 @@ use std::error::Error;
 use std::fs;
 use clap::{ArgAction, Parser, ArgGroup};
 use std::path::PathBuf;
+use tracing::{error, info};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::FmtSubscriber;
 use crate::converter::aidoku::AidokuConverter;
 use crate::converter::{BackupReader, BackupWriter};
 use crate::converter::tachiyomi::TachiyomiConverter;
@@ -24,12 +27,13 @@ use crate::matching::tachiyomi::TachiyomiExtensionRepo;
         .args(["output", "to"])
         .required(true)
 ))]
+#[command(name = "Converter", about = "Tool for converting backups from one reader to another")]
 struct Args {
-    /// Input file, also accepted positionally
+    /// Input file
     #[arg(short = 'i', long = "input", conflicts_with = "input", value_parser = input_check)]
     input_flag: Option<FileArg>,
 
-    /// Positional input file, equivalent to --input
+    /// Positional input
     #[arg(conflicts_with = "input_flag", value_parser = input_check)]
     input: Option<FileArg>,
 
@@ -37,7 +41,7 @@ struct Args {
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Output target type. Overrides output file extension when both are present.
+    /// Output target type. Overrides output file extension when both are present
     #[arg(short = 't', long = "to", value_enum)]
     to: Option<SourceId>,
 
@@ -92,7 +96,7 @@ fn output_parse(args: &Args) -> FileArg {
             Some("json") | Some("aib") => Aidoku,
             Some("tachibk") => Tachiyomi,
             _ => {
-                eprintln!("Error: Could not infer target format from output file extension.");
+                error!("Error: Could not infer target format from output file extension. Define with -o or -t.");
                 std::process::exit(1);
             }
         }
@@ -116,7 +120,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input = input_parse(&args);
     let output = output_parse(&args);
 
+    if input.kind == output.kind {
+        return Err("Input and output cannot be the same format.".into());
+    }
+
     let verbosity = args.verbose;
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(match verbosity {
+            0 => LevelFilter::INFO,
+            1 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE
+        })
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     // make sure there's at least 1 repo to match between
     let mut matcher = Matcher::new();
@@ -148,6 +164,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path = output.path.expect("Should be a path at this point");
     fs::write(&output_path, output_bytes)?;
 
-    println!("Wrote out backup to `{}`", output_path.display());
+    info!("Wrote out backup to `{}`", output_path.display());
     Ok(())
 }
