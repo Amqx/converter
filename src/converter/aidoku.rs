@@ -716,25 +716,36 @@ fn aidoku_source_id(source: &SourceData, manga_title: &str) -> Result<String> {
 
 fn library_entry_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
     let mut entry = Dictionary::new();
-    if let Some(date_added) = manga.date_added {
-        entry.insert(
-            "dateAdded".into(),
-            PlistValue::Date(plist_date_from_millis(date_added)),
-        );
-    }
-    if let Some(last_read) = manga.history.iter().map(|history| history.last_read).max() {
+    let date_added = library_date_added(manga);
+    let last_read = manga.history.iter().map(|history| history.last_read).max();
+    let last_updated_chapters = manga
+        .chapters
+        .iter()
+        .map(|chapter| chapter.date_uploaded)
+        .filter(|date| *date != 0)
+        .max();
+
+    entry.insert(
+        "dateAdded".into(),
+        PlistValue::Date(plist_date_from_millis(date_added)),
+    );
+    entry.insert(
+        "lastOpened".into(),
+        PlistValue::Date(plist_date_from_millis(last_read.unwrap_or(date_added))),
+    );
+    entry.insert(
+        "lastUpdated".into(),
+        PlistValue::Date(plist_date_from_millis(
+            last_updated_chapters.unwrap_or(date_added),
+        )),
+    );
+    if let Some(last_read) = last_read {
         entry.insert(
             "lastRead".into(),
             PlistValue::Date(plist_date_from_millis(last_read)),
         );
     }
-    if let Some(last_updated_chapters) = manga
-        .chapters
-        .iter()
-        .map(|chapter| chapter.date_uploaded)
-        .filter(|date| *date != 0)
-        .max()
-    {
+    if let Some(last_updated_chapters) = last_updated_chapters {
         entry.insert(
             "lastUpdatedChapters".into(),
             PlistValue::Date(plist_date_from_millis(last_updated_chapters)),
@@ -755,6 +766,18 @@ fn library_entry_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
     entry.insert("sourceId".into(), PlistValue::String(source_id.to_owned()));
 
     PlistValue::Dictionary(entry)
+}
+
+fn library_date_added(manga: &Manga) -> i64 {
+    manga.date_added.unwrap_or_else(|| {
+        manga
+            .history
+            .iter()
+            .map(|history| history.last_read)
+            .chain(manga.chapters.iter().map(|chapter| chapter.date_uploaded))
+            .max()
+            .unwrap_or_default()
+    })
 }
 
 fn manga_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
@@ -809,9 +832,7 @@ fn chapter_to_plist(
     if chapter.id.starts_with("http://") || chapter.id.starts_with("https://") {
         item.insert("url".into(), PlistValue::String(chapter.id.clone()));
     }
-    if let Some(lang) = aidoku_lang_code(source_id) {
-        item.insert("lang".into(), PlistValue::String(lang));
-    }
+    item.insert("lang".into(), PlistValue::String(aidoku_lang_code(source_id)));
     item.insert("chapter".into(), PlistValue::Real(chapter.chapter_number));
     if chapter.date_uploaded != 0 {
         item.insert(
@@ -875,9 +896,9 @@ fn synthesized_history_time(manga: &Manga, chapter: &Chapter) -> i64 {
         chapter.date_uploaded,
         manga.date_added.unwrap_or_default(),
     ]
-    .into_iter()
-    .max()
-    .unwrap_or_default()
+        .into_iter()
+        .max()
+        .unwrap_or_default()
 }
 
 fn categories_to_plist(backup: &Backup) -> Vec<PlistValue> {
@@ -917,9 +938,11 @@ fn insert_optional_string(dictionary: &mut Dictionary, key: &str, value: Option<
     }
 }
 
-fn aidoku_lang_code(source_id: &str) -> Option<String> {
-    let code = source_id.split('.').next()?;
-    (!code.is_empty() && code != "multi").then(|| code.to_owned())
+fn aidoku_lang_code(source_id: &str) -> String {
+    match source_id.split('.').next() {
+        Some(code) if !code.is_empty() && code != "multi" => code.to_owned(),
+        _ => String::new(),
+    }
 }
 
 fn latest_backup_time(backup: &Backup) -> i64 {
