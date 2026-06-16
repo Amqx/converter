@@ -2,7 +2,8 @@ use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
     Result,
 };
-use crate::matching::{Matcher, SourceData, SourceId, SourceRepo};
+use crate::matching::{Matcher, SourceData, SourceRepo};
+use crate::reader::ReaderId;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -63,9 +64,9 @@ impl BackupReader for TachiyomiConverter {
             .collect();
 
         Ok(Backup {
-            source: SourceId::Tachiyomi,
+            reader: ReaderId::Tachiyomi,
             manga,
-            categories
+            categories,
         })
     }
 }
@@ -95,7 +96,7 @@ impl BackupWriter for TachiyomiConverter {
                 "Converting manga to Tachiyomi"
             );
             let source_key = (
-                manga.source.source,
+                manga.source.reader,
                 manga.source.external_id.clone(),
                 manga.source.name.clone(),
             );
@@ -240,7 +241,7 @@ fn manga_to_ir(
     Manga {
         id: manga.url.clone(),
         source: SourceData {
-            source: SourceId::Tachiyomi,
+            reader: ReaderId::Tachiyomi,
             name: source_names.get(&manga.source).cloned(),
             external_id: Some(manga.source.to_string()),
             url: None,
@@ -335,7 +336,7 @@ fn category_to_proto((idx, category): (usize, &Category)) -> proto::BackupCatego
 }
 
 fn tachiyomi_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<TachiyomiSource> {
-    if manga.source.source == SourceId::Tachiyomi {
+    if manga.source.reader == ReaderId::Tachiyomi {
         return Ok(TachiyomiSource {
             id: parse_source_id(&manga.source, &manga.title)?,
             name: manga.source.name.clone(),
@@ -347,7 +348,7 @@ fn tachiyomi_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<Tachiy
         .find_matches(&manga.source)
         .map_err(|err| IRError::Matcher(err.to_string()))?
         .into_iter()
-        .filter(|source| source.source == SourceId::Tachiyomi)
+        .filter(|source| source.reader == ReaderId::Tachiyomi)
         .find_map(|source| {
             let id = source.external_id.as_deref()?.parse::<i64>().ok()?;
             Some(TachiyomiSource {

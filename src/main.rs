@@ -1,13 +1,15 @@
 mod converter;
 mod matching;
+mod reader;
 
 use crate::converter::aidoku::AidokuConverter;
 use crate::converter::tachiyomi::TachiyomiConverter;
 use crate::converter::{BackupReader, BackupStats, BackupWriter};
-use crate::matching::SourceId::{Aidoku, Tachiyomi};
+use crate::matching::Matcher;
 use crate::matching::aidoku::AidokuSourceList;
 use crate::matching::tachiyomi::TachiyomiExtensionRepo;
-use crate::matching::{Matcher, SourceId};
+use crate::reader::ReaderId;
+use crate::reader::ReaderId::{Aidoku, Tachiyomi};
 use clap::{ArgAction, ArgGroup, Parser};
 use std::error::Error;
 use std::fs;
@@ -46,7 +48,7 @@ struct Args {
 
     /// Output target type. Overrides output file extension when both are present
     #[arg(short = 't', long = "to", value_enum)]
-    to: Option<SourceId>,
+    to: Option<ReaderId>,
 
     /// Add custom Aidoku repositories
     #[arg(long = "aidoku-repo", value_name = "REPO", num_args = 1..)]
@@ -68,7 +70,7 @@ struct Args {
 #[derive(Clone, Debug)]
 struct FileArg {
     pub path: Option<PathBuf>,
-    pub kind: SourceId,
+    pub kind: ReaderId,
 }
 
 fn input_check(s: &str) -> Result<FileArg, String> {
@@ -220,7 +222,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         Aidoku => AidokuConverter::write_backup(&input_backup, &matcher)?,
     };
     debug!(bytes = output_bytes.len(), "Serialized output backup bytes");
-
 
     fs::write(&output_path, output_bytes)?;
     info!("Wrote output backup to `{}`", output_path.display());

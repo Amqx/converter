@@ -2,7 +2,8 @@ use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
     Result,
 };
-use crate::matching::{Language, Matcher, SourceData, SourceId};
+use crate::matching::{Language, Matcher, SourceData};
+use crate::reader::ReaderId;
 use plist::{Dictionary, Value as PlistValue};
 use serde_json::{Map, Number, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
@@ -49,9 +50,9 @@ impl BackupReader for AidokuConverter {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Backup {
-            source: SourceId::Aidoku,
+            reader: ReaderId::Aidoku,
             manga,
-            categories: categories_to_ir(root)
+            categories: categories_to_ir(root),
         })
     }
 }
@@ -81,7 +82,7 @@ impl BackupWriter for AidokuConverter {
                 "Converting manga to Aidoku"
             );
             let source_key = (
-                manga.source.source,
+                manga.source.reader,
                 manga.source.external_id.clone(),
                 manga.source.name.clone(),
             );
@@ -151,12 +152,7 @@ impl BackupWriter for AidokuConverter {
                     url: chapter.id.clone(),
                     last_read: synthesized_history_time(manga, chapter),
                 };
-                history_items.push(history_to_plist(
-                    &history,
-                    manga,
-                    &source_id,
-                    Some(chapter),
-                ));
+                history_items.push(history_to_plist(&history, manga, &source_id, Some(chapter)));
             }
         }
 
@@ -205,7 +201,7 @@ impl BackupWriter for AidokuConverter {
         root.insert("automatic".into(), PlistValue::Boolean(false));
         root.insert(
             "name".into(),
-            PlistValue::String(format!("Converted from {}", backup.source)),
+            PlistValue::String(format!("Converted from {}", backup.reader)),
         );
         root.insert(
             "version".into(),
@@ -258,11 +254,12 @@ fn plist_to_json(value: PlistValue) -> JsonValue {
             let time: SystemTime = value.into();
             JsonValue::Number(Number::from(system_time_to_millis(time)))
         }
-        PlistValue::Integer(value) => value
-            .as_signed()
-            .map_or(JsonValue::Null, |value| JsonValue::Number(Number::from(value))),
-        PlistValue::Real(value) => Number::from_f64(value)
-            .map_or(JsonValue::Null, JsonValue::Number),
+        PlistValue::Integer(value) => value.as_signed().map_or(JsonValue::Null, |value| {
+            JsonValue::Number(Number::from(value))
+        }),
+        PlistValue::Real(value) => {
+            Number::from_f64(value).map_or(JsonValue::Null, JsonValue::Number)
+        }
         PlistValue::String(value) => JsonValue::String(value),
         PlistValue::Uid(value) => JsonValue::Number(Number::from(value.get())),
         _ => JsonValue::Null,
@@ -469,7 +466,7 @@ fn source_data_for(
     chapters: Option<&Vec<&JsonObject>>,
 ) -> SourceData {
     SourceData {
-        source: SourceId::Aidoku,
+        reader: ReaderId::Aidoku,
         name: Some(source_name_from_id(source_id)),
         external_id: Some(source_id.to_owned()),
         url: source_base_url(manga, chapters),
@@ -692,7 +689,7 @@ fn status_to_aidoku(status: &MangaStatus) -> i64 {
 }
 
 fn aidoku_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<SourceData> {
-    if manga.source.source == SourceId::Aidoku {
+    if manga.source.reader == ReaderId::Aidoku {
         aidoku_source_id(&manga.source, &manga.title)?;
         return Ok(manga.source.clone());
     }
@@ -701,7 +698,7 @@ fn aidoku_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<SourceDat
         .find_matches(&manga.source)
         .map_err(|err| IRError::Matcher(err.to_string()))?
         .into_iter()
-        .filter(|source| source.source == SourceId::Aidoku)
+        .filter(|source| source.reader == ReaderId::Aidoku)
         .find(|source| source.external_id.is_some())
         .ok_or_else(|| {
             IRError::Matcher(format!(
@@ -837,7 +834,10 @@ fn chapter_to_plist(
     if chapter.id.starts_with("http://") || chapter.id.starts_with("https://") {
         item.insert("url".into(), PlistValue::String(chapter.id.clone()));
     }
-    item.insert("lang".into(), PlistValue::String(aidoku_lang_code(source_id)));
+    item.insert(
+        "lang".into(),
+        PlistValue::String(aidoku_lang_code(source_id)),
+    );
     item.insert("chapter".into(), PlistValue::Real(chapter.chapter_number));
     if chapter.date_uploaded != 0 {
         item.insert(

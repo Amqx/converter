@@ -1,5 +1,6 @@
-use super::SourceId::Aidoku;
-use super::{Language, Result, Source, SourceData, SourceId, SourceRepo, normalized_key};
+use super::{Language, Result, Source, SourceData, SourceRepo, normalized_key};
+use crate::reader::ReaderId;
+use crate::reader::ReaderId::Aidoku;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +27,7 @@ impl fmt::Display for AidokuEntry {
 impl AidokuEntry {
     fn to_source_data(&self) -> SourceData {
         SourceData {
-            source: Aidoku,
+            reader: Aidoku,
             name: Some(self.name.clone()),
             external_id: Some(self.id.clone()),
             url: Some(self.url.clone()),
@@ -68,7 +69,7 @@ pub struct AidokuSourceList {
 }
 
 impl AidokuSourceList {
-    const ID: SourceId = Aidoku;
+    const READER_ID: ReaderId = Aidoku;
 
     pub fn new(index_url: impl Into<String>) -> Result<Self> {
         let mut s = Self::empty(index_url);
@@ -162,8 +163,8 @@ impl AidokuSourceList {
 }
 
 impl Source for AidokuSourceList {
-    fn id(&self) -> SourceId {
-        Self::ID
+    fn reader_id(&self) -> ReaderId {
+        Self::READER_ID
     }
 
     fn search(&self, query: &SourceData) -> Result<Vec<SourceData>> {
@@ -204,7 +205,7 @@ mod tests {
                 .unwrap();
 
         let query = SourceData {
-            source: SourceId::Tachiyomi,
+            reader: ReaderId::Tachiyomi,
             name: Some("MangaDex".into()),
             external_id: Some("2499283573021220255".into()),
             url: Some("https://mangadex.org".into()),

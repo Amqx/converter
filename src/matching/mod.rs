@@ -1,4 +1,4 @@
-use clap::ValueEnum;
+use crate::reader::ReaderId;
 use std::fmt;
 use tracing::{debug, trace};
 
@@ -20,20 +20,6 @@ pub enum MatcherError {
     ParseInt(#[from] std::num::ParseIntError),
 }
 pub type Result<T> = std::result::Result<T, MatcherError>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
-pub enum SourceId {
-    Aidoku,
-    Tachiyomi,
-}
-impl fmt::Display for SourceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SourceId::Aidoku => write!(f, "Aidoku"),
-            SourceId::Tachiyomi => write!(f, "Tachiyomi"),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -77,7 +63,7 @@ pub struct SourceRepo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceData {
-    pub source: SourceId,
+    pub reader: ReaderId,
     pub name: Option<String>,
     pub external_id: Option<String>,
     pub url: Option<String>,
@@ -90,7 +76,7 @@ pub(super) fn normalized_key(value: &str) -> String {
 }
 
 pub trait Source {
-    fn id(&self) -> SourceId;
+    fn reader_id(&self) -> ReaderId;
 
     fn search(&self, query: &SourceData) -> Result<Vec<SourceData>>;
 }
@@ -120,7 +106,7 @@ impl Matcher {
         let mut all_results = Vec::new();
 
         debug!(
-            query_source = ?query.source,
+            query_reader = ?query.reader,
             query_name = ?query.name,
             query_external_id = ?query.external_id,
             query_url = ?query.url,
@@ -129,21 +115,21 @@ impl Matcher {
         );
 
         for source in &self.sources {
-            if query.source == source.id() {
+            if query.reader == source.reader_id() {
                 trace!(
-                    source = ?source.id(),
+                    reader = ?source.reader_id(),
                     "Skipping matcher source because it matches the query source"
                 );
                 continue;
             }
-            trace!(source = ?source.id(), "Searching matcher source");
+            trace!(reader = ?source.reader_id(), "Searching matcher source");
             let results = source.search(query)?;
             debug!(
-                source = ?source.id(),
+                reader = ?source.reader_id(),
                 matches = results.len(),
                 "Matcher source returned results"
             );
-            trace!(source = ?source.id(), ?results, "Matcher source result details");
+            trace!(reader = ?source.reader_id(), ?results, "Matcher source result details");
             all_results.extend(results);
         }
 

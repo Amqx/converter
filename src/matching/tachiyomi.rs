@@ -1,5 +1,6 @@
-use super::SourceId::Tachiyomi;
-use super::{Language, Result, Source, SourceData, SourceId, SourceRepo, normalized_key};
+use super::{Language, Result, Source, SourceData, SourceRepo, normalized_key};
+use crate::reader::ReaderId;
+use crate::reader::ReaderId::Tachiyomi;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +26,7 @@ impl fmt::Display for TachiyomiEntry {
 impl TachiyomiEntry {
     fn to_source_data(&self, repo: Option<SourceRepo>) -> SourceData {
         SourceData {
-            source: Tachiyomi,
+            reader: Tachiyomi,
             name: Some(self.name.clone()),
             external_id: Some(self.id.to_string()),
             url: Some(self.url.clone()),
@@ -95,7 +96,7 @@ pub struct TachiyomiExtensionRepo {
 }
 
 impl TachiyomiExtensionRepo {
-    const ID: SourceId = Tachiyomi;
+    const READER_ID: ReaderId = Tachiyomi;
 
     pub fn new(index_url: impl Into<String>) -> Result<Self> {
         let mut s = Self::empty(index_url);
@@ -143,8 +144,10 @@ impl TachiyomiExtensionRepo {
     }
 
     fn repo_info_url(&self) -> String {
-        self.index_url
-            .rsplit_once('/').map_or_else(|| "repo.json".to_string(), |(base, _)| format!("{base}/repo.json"))
+        self.index_url.rsplit_once('/').map_or_else(
+            || "repo.json".to_string(),
+            |(base, _)| format!("{base}/repo.json"),
+        )
     }
 
     fn get_repo_info(&mut self, client: &Client) -> Result<()> {
@@ -229,8 +232,8 @@ impl TachiyomiExtensionRepo {
 }
 
 impl Source for TachiyomiExtensionRepo {
-    fn id(&self) -> SourceId {
-        Self::ID
+    fn reader_id(&self) -> ReaderId {
+        Self::READER_ID
     }
 
     fn search(&self, query: &SourceData) -> Result<Vec<SourceData>> {
@@ -290,7 +293,7 @@ mod tests {
         println!("Yuzono info: {:?}", yuzono.info());
 
         let query = SourceData {
-            source: SourceId::Aidoku,
+            reader: ReaderId::Aidoku,
             name: Some("MangaPill".into()),
             external_id: Some("en.mangapill".into()),
             url: Some("https://mangapill.com".into()),
