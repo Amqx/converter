@@ -27,4 +27,7 @@ converter -h
 
 ```
 
+## Notes
+- Aidoku needs a chance to update all imported library entries before correctly registering finished chapter counts.
+
 Licensed under GPL-3.0.
