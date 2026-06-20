@@ -7,7 +7,7 @@ edition = "2024"
 clap = { version = "4.6.1", features = ["derive"] }
 flate2 = "1.1.9"
 isolang = "2.4.0"
-plist = "1.9.0"
+plist = { git = "https://github.com/Amqx/rust-plist.git", branch = "master" }
 prost = "0.14.4"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }

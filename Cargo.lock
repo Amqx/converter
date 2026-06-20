@@ -964,8 +964,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "plist"
 version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
+source = "git+https://github.com/Amqx/rust-plist.git?branch=master#75012e1d1e9ad3d1a6808ec07208c31dd173be00"
 dependencies = [
  "base64",
  "indexmap",
