@@ -26,6 +26,18 @@ cargo install --path .
 converter -h
 
 ```
+## Developing
+
+The project contains two helper scripts for decoding Aidoku and TachiyomiSY's backups. These live in the `scripts/`
+directory. Install dependencies with [uv](https://docs.astral.sh/uv/):
+
+```shell
+# Make sure you have uv installed beforehand
+uv sync
+
+uv run ./scripts/decode_tachiyomi.py <backup.tachibk>
+uv run ./scripts/decode_aidoku.py <backup.aib>
+```
 
 ## Notes
 - Aidoku needs a chance to update all imported library entries before correctly registering finished chapter counts.
