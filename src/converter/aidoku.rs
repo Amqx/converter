@@ -73,6 +73,7 @@ impl BackupWriter for AidokuConverter {
         let mut chapter_items = Vec::new();
         let mut history_items = Vec::new();
         let mut skipped_manga = 0usize;
+        let mut non_favorite_manga = 0usize;
 
         for manga in &backup.manga {
             trace!(
@@ -120,8 +121,15 @@ impl BackupWriter for AidokuConverter {
             }
 
             source_ids.insert(source_id.clone());
-            library.push(library_entry_to_plist(manga, &source_id));
-            manga_items.push(manga_to_plist(manga, &source_id));
+
+            // Aidoku's library tracks membership by presence in the library array. We skip entries
+            // for non-favorites to prevent history leaking into the user's library.
+            if manga.favorite {
+                library.push(library_entry_to_plist(manga, &source_id));
+            } else {
+                non_favorite_manga += 1;
+            }
+            manga_items.push(manga_to_plist(manga, &source_id));    // always track history
 
             let chapters_by_id = manga
                 .chapters
@@ -161,7 +169,9 @@ impl BackupWriter for AidokuConverter {
         let mut source_list_urls = source_list_urls.into_iter().collect::<Vec<_>>();
         source_list_urls.sort();
         info!(
-            converted_manga = library.len(),
+            converted_manga = manga_items.len(),
+            library_entries = library.len(),
+            non_favorite_manga,
             skipped_manga,
             sources = source_ids.len(),
             source_lists = source_list_urls.len(),
