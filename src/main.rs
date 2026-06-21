@@ -12,15 +12,15 @@ use crate::matching::aidoku::AidokuSourceList;
 use crate::matching::tachiyomi::TachiyomiExtensionRepo;
 use crate::reader::ReaderId;
 use crate::reader::ReaderId::{Aidoku, Tachiyomi};
-use crate::report::{ConversionReport};
+use crate::report::{ConversionReport, ReadReport, WriteReport};
+use chrono::Local;
 use clap::{ArgAction, ArgGroup, Parser};
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
-use chrono::{Local};
 
 #[derive(Parser, Debug)]
 #[command(group(
@@ -143,16 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Input and output cannot be the same format.".into());
     }
 
-    let verbosity = args.verbose;
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(match verbosity {
-            0 => LevelFilter::WARN,
-            1 => LevelFilter::INFO,
-            2 => LevelFilter::DEBUG,
-            _ => LevelFilter::TRACE,
-        })
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    init_tracing(args.verbose)?;
 
     let input_path = input.path.expect("Should be a path at this point");
     let output_path = output.path.expect("Should be a path at this point");
@@ -168,37 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Resolved conversion paths"
     );
 
-    // make sure there's at least 1 repo to match between
-    let mut matcher = Matcher::new();
-    let no_defaults = args.no_defaults;
-    let aidoku_repos = args.aidoku_repo;
-    let tachi_repos = args.tachi_repo;
-    if no_defaults {
-        info!("Default source repositories disabled");
-        if aidoku_repos.is_empty() || tachi_repos.is_empty() {
-            return Err("Not enough repos for matching, either use defaults or provide your own with -aidoku-repo and -tachi-repo".into());
-        }
-        debug!(
-            aidoku_repos = aidoku_repos.len(),
-            tachiyomi_repos = tachi_repos.len(),
-            "Validated user-provided source repository arguments"
-        );
-    } else {
-        info!("Loading default source repositories for matching");
-        let tachi_default = TachiyomiExtensionRepo::default()?;
-        debug!("Loaded default Tachiyomi source repository");
-        let aidoku_default = AidokuSourceList::default()?;
-        debug!("Loaded default Aidoku source list");
-
-        matcher.register_source(Box::new(tachi_default));
-        matcher.register_source(Box::new(aidoku_default));
-    }
-    for aidoku_repo in aidoku_repos {
-        matcher.register_source(Box::new(AidokuSourceList::new(aidoku_repo)?));
-    }
-    for tachi_repo in tachi_repos {
-        matcher.register_source(Box::new(TachiyomiExtensionRepo::new(tachi_repo)?));
-    }
+    let matcher = build_matcher(&args)?;
 
     info!("Reading input backup");
     let input_file = fs::read(&input_path)?;
@@ -232,27 +193,91 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("Wrote output backup to `{}`", output_path.display());
     info!("Finished backup conversion");
 
-    let report_path = {
-        let mut p = output_path.clone().into_os_string();
-        p.push(".report.txt");
-        PathBuf::from(p)
+    write_conversion_report(
+        &input_path,
+        &output_path,
+        input.kind,
+        output.kind,
+        &matcher,
+        read_report,
+        write_report,
+    );
+
+    Ok(())
+}
+
+fn init_tracing(verbosity: u8) -> Result<(), Box<dyn Error>> {
+    let level = match verbosity {
+        0 => LevelFilter::WARN,
+        1 => LevelFilter::INFO,
+        2 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
     };
+    let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+    Ok(())
+}
+
+/// Build a [`Matcher`] from the default source repositories and/or the
+/// user-provided ones. There must be at least one source per reader to match
+/// between, so `--no-defaults` requires both `--aidoku-repo` and `--tachi-repo`.
+fn build_matcher(args: &Args) -> Result<Matcher, Box<dyn Error>> {
+    let mut matcher = Matcher::new();
+
+    if args.no_defaults {
+        info!("Default source repositories disabled");
+        if args.aidoku_repo.is_empty() || args.tachi_repo.is_empty() {
+            return Err("Not enough repos for matching, either use defaults or provide your own with -aidoku-repo and -tachi-repo".into());
+        }
+        debug!(
+            aidoku_repos = args.aidoku_repo.len(),
+            tachiyomi_repos = args.tachi_repo.len(),
+            "Validated user-provided source repository arguments"
+        );
+    } else {
+        info!("Loading default source repositories for matching");
+        matcher.register_source(Box::new(TachiyomiExtensionRepo::default()?));
+        debug!("Loaded default Tachiyomi source repository");
+        matcher.register_source(Box::new(AidokuSourceList::default()?));
+        debug!("Loaded default Aidoku source list");
+    }
+
+    for repo in &args.aidoku_repo {
+        matcher.register_source(Box::new(AidokuSourceList::new(repo.as_str())?));
+    }
+    for repo in &args.tachi_repo {
+        matcher.register_source(Box::new(TachiyomiExtensionRepo::new(repo.as_str())?));
+    }
+
+    Ok(matcher)
+}
+
+/// Write the human-readable `<output>.report.txt` next to the output file.
+/// A failure here is logged but not fatal — the conversion itself succeeded.
+fn write_conversion_report(
+    input_path: &Path,
+    output_path: &Path,
+    from: ReaderId,
+    to: ReaderId,
+    matcher: &Matcher,
+    read: ReadReport,
+    write: WriteReport,
+) {
+    let mut report_path = output_path.as_os_str().to_owned();
+    report_path.push(".report.txt");
+    let report_path = PathBuf::from(report_path);
+
     let report = ConversionReport {
         timestamp: Local::now().format("%Y-%m-%d %H:%M %Z").to_string(),
-        input_file: input_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| input_path.display().to_string()),
-        output_file: output_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| output_path.display().to_string()),
-        from: input.kind,
-        to: output.kind,
+        input_file: file_label(input_path),
+        output_file: file_label(output_path),
+        from,
+        to,
         repos: matcher.repos(),
-        read: read_report,
-        write: write_report,
+        read,
+        write,
     };
+
     match fs::write(&report_path, report.render()) {
         Ok(()) => info!("Wrote conversion report to `{}`", report_path.display()),
         Err(err) => warn!(
@@ -261,6 +286,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             "Failed to write conversion report (conversion itself succeeded)"
         ),
     }
+}
 
-    Ok(())
+/// The file name for display in the report, falling back to the full path.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }

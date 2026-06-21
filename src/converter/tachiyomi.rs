@@ -1,11 +1,11 @@
 use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
-    Result,
+    Result, WriteTracker,
 };
 use crate::blacklist;
 use crate::matching::{Matcher, SourceData, SourceRepo};
 use crate::reader::ReaderId;
-use crate::report::{DroppedManga, ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
+use crate::report::{DroppedManga, ReadReport, WriteReport};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -87,13 +87,10 @@ impl BackupWriter for TachiyomiConverter {
         let mut backup_extension_repo = Vec::new();
         let category_ids = category_ids_by_name(&backup.categories);
 
-        let mut failed_sources = HashSet::new();
+        let mut tracker = WriteTracker::default();
         let mut backup_manga = Vec::new();
-        let mut mappings: Vec<SourceMapping> = Vec::new();
-        let mut mapped_sources: HashSet<(ReaderId, Option<String>, Option<String>)> = HashSet::new();
-        let mut skipped_sources: Vec<SkippedSource> = Vec::new();
-        let mut skipped_index: HashMap<(ReaderId, Option<String>, Option<String>), usize> =
-            HashMap::new();
+        let mut converted_chapters = 0;
+        let mut converted_history = 0;
         for manga in &backup.manga {
             trace!(
                 title = %manga.title,
@@ -101,72 +98,40 @@ impl BackupWriter for TachiyomiConverter {
                 history_entries = manga.history.len(),
                 "Converting manga to Tachiyomi"
             );
-            let source_key = (
-                manga.source.reader,
-                manga.source.external_id.clone(),
-                manga.source.name.clone(),
-            );
-            if failed_sources.contains(&source_key) {
+
+            if tracker.note_if_failed(manga) {
                 warn!(
                     title = %manga.title,
-                    source = source_key.2,
+                    source = manga.source.name,
                     "skipping manga because its source previously failed to match"
                 );
-                if let Some(&idx) = skipped_index.get(&source_key) {
-                    skipped_sources[idx].manga.push(SkippedManga {
-                        title: manga.title.clone(),
-                        chapters: manga.chapters.len(),
-                        history: manga.history.len(),
-                    });
-                }
                 continue;
             }
+
             let tachiyomi_source = match tachiyomi_source_for_manga(manga, matcher) {
                 Ok(source) => source,
                 Err(err) => {
                     warn!(
                         title = %manga.title,
-                        source = source_key.2,
+                        source = manga.source.name,
                         error = %err,
                         "failed to match source; skipping this and subsequent manga from the same source"
                     );
-                    let label = format!(
-                        "{} ({})",
-                        manga.source.name.as_deref().unwrap_or("unknown"),
-                        manga.source.reader
-                    );
-                    let idx = skipped_sources.len();
-                    skipped_sources.push(SkippedSource {
-                        source_label: label,
-                        reason: "no matching Tachiyomi source found".to_string(),
-                        manga: vec![SkippedManga {
-                            title: manga.title.clone(),
-                            chapters: manga.chapters.len(),
-                            history: manga.history.len(),
-                        }],
-                    });
-                    skipped_index.insert(source_key.clone(), idx);
-                    failed_sources.insert(source_key);
+                    tracker.record_failure(manga, "no matching Tachiyomi source found");
                     continue;
                 }
             };
 
-            if mapped_sources.insert(source_key.clone()) {
-                let from = format!(
-                    "{} ({})",
-                    manga.source.name.as_deref().unwrap_or("unknown"),
-                    manga.source.reader
-                );
-                let to = format!(
+            tracker.record_mapping(manga, || {
+                format!(
                     "{} ({})",
                     tachiyomi_source
                         .name
                         .clone()
                         .unwrap_or_else(|| tachiyomi_source.id.to_string()),
                     ReaderId::Tachiyomi
-                );
-                mappings.push(SourceMapping { from, to });
-            }
+                )
+            });
 
             if source_ids.insert(tachiyomi_source.id) {
                 backup_sources.push(proto::BackupSource {
@@ -181,6 +146,8 @@ impl BackupWriter for TachiyomiConverter {
                 backup_extension_repo.push(repo_to_proto(repo));
             }
 
+            converted_chapters += manga.chapters.len();
+            converted_history += manga.history.len();
             backup_manga.push(manga_to_proto(manga, tachiyomi_source.id, &category_ids));
         }
 
@@ -190,32 +157,15 @@ impl BackupWriter for TachiyomiConverter {
             .enumerate()
             .map(category_to_proto)
             .collect();
-        let skipped_manga: usize = skipped_sources.iter().map(|s| s.manga.len()).sum();
         info!(
             converted_manga = backup_manga.len(),
-            skipped_manga,
+            skipped_manga = tracker.skipped_manga_count(),
             sources = backup_sources.len(),
             extension_repos = backup_extension_repo.len(),
             "Finished building Tachiyomi backup data"
         );
 
-        // Sum chapters and history over the manga that were actually converted
-        // (their source wasn't in `failed_sources`) in a single pass.
-        let (converted_chapters, converted_history) = backup
-            .manga
-            .iter()
-            .filter(|m| {
-                let key = (
-                    m.source.reader,
-                    m.source.external_id.clone(),
-                    m.source.name.clone(),
-                );
-                !failed_sources.contains(&key)
-            })
-            .fold((0usize, 0usize), |(chapters, history), m| {
-                (chapters + m.chapters.len(), history + m.history.len())
-            });
-
+        let (mappings, skipped_sources) = tracker.into_parts();
         let write_report = WriteReport {
             manga: backup_manga.len(),
             chapters: converted_chapters,
@@ -332,7 +282,9 @@ fn manga_to_ir(
             manga.custom_genre
         },
         cover_url: manga.custom_thumbnail_url.or(manga.thumbnail_url),
-        status: status_to_ir(manga.custom_status.or(manga.status).unwrap_or_default()),
+        status: MangaStatus::from_code(i64::from(
+            manga.custom_status.or(manga.status).unwrap_or_default(),
+        )),
         nsfw: false,
         date_added: manga.date_added,
         categories: manga
@@ -371,18 +323,6 @@ fn history_to_ir(history: proto::BackupHistory) -> History {
     History {
         url: history.url,
         last_read: history.last_read,
-    }
-}
-
-fn status_to_ir(status: i32) -> MangaStatus {
-    match status {
-        1 => MangaStatus::Ongoing,
-        2 => MangaStatus::Completed,
-        3 => MangaStatus::Licensed,
-        4 => MangaStatus::PublishingFinished,
-        5 => MangaStatus::Cancelled,
-        6 => MangaStatus::OnHiatus,
-        _ => MangaStatus::Unknown,
     }
 }
 
@@ -476,7 +416,7 @@ fn manga_to_proto(
         author: manga.author.clone(),
         description: manga.desc.clone(),
         genre: manga.tags.clone(),
-        status: Some(status_to_proto(&manga.status)),
+        status: Some(manga.status.code() as i32),
         thumbnail_url: manga.cover_url.clone(),
         date_added: manga.date_added,
         viewer: None,
@@ -537,17 +477,5 @@ fn history_to_proto(history: &History) -> proto::BackupHistory {
         url: history.url.clone(),
         last_read: history.last_read,
         read_duration: None,
-    }
-}
-
-fn status_to_proto(status: &MangaStatus) -> i32 {
-    match status {
-        MangaStatus::Unknown => 0,
-        MangaStatus::Ongoing => 1,
-        MangaStatus::Completed => 2,
-        MangaStatus::Licensed => 3,
-        MangaStatus::PublishingFinished => 4,
-        MangaStatus::Cancelled => 5,
-        MangaStatus::OnHiatus => 6,
     }
 }

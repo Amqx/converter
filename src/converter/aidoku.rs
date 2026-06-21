@@ -1,17 +1,17 @@
 use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
-    Result,
+    Result, WriteTracker,
 };
 use crate::blacklist;
 use crate::matching::{Language, Matcher, SourceData};
 use crate::reader::ReaderId;
-use crate::report::{DroppedManga, ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
+use crate::report::{DroppedManga, ReadReport, WriteReport};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use plist::{Dictionary, Value as PlistValue};
 use serde_json::{Map, Number, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::time::{SystemTime};
-use chrono::{DateTime, Utc};
+use std::time::SystemTime;
 use tracing::{debug, info, trace, warn};
 
 pub struct AidokuConverter;
@@ -82,7 +82,6 @@ impl BackupWriter for AidokuConverter {
             "Building Aidoku backup"
         );
 
-        let mut failed_sources = HashSet::new();
         let mut source_ids = HashSet::new();
         let mut source_list_urls = HashSet::new();
         let mut library = Vec::new();
@@ -90,11 +89,7 @@ impl BackupWriter for AidokuConverter {
         let mut chapter_items = Vec::new();
         let mut history_items = Vec::new();
         let mut non_favorite_manga = 0usize;
-        let mut mappings: Vec<SourceMapping> = Vec::new();
-        let mut mapped_sources: HashSet<(ReaderId, Option<String>, Option<String>)> = HashSet::new();
-        let mut skipped_sources: Vec<SkippedSource> = Vec::new();
-        let mut skipped_index: HashMap<(ReaderId, Option<String>, Option<String>), usize> =
-            HashMap::new();
+        let mut tracker = WriteTracker::default();
 
         for manga in &backup.manga {
             trace!(
@@ -103,24 +98,13 @@ impl BackupWriter for AidokuConverter {
                 history_entries = manga.history.len(),
                 "Converting manga to Aidoku"
             );
-            let source_key = (
-                manga.source.reader,
-                manga.source.external_id.clone(),
-                manga.source.name.clone(),
-            );
-            if failed_sources.contains(&source_key) {
+
+            if tracker.note_if_failed(manga) {
                 warn!(
                     title = %manga.title,
-                    source = source_key.2,
+                    source = manga.source.name,
                     "skipping manga because its Aidoku source previously failed to match"
                 );
-                if let Some(&idx) = skipped_index.get(&source_key) {
-                    skipped_sources[idx].manga.push(SkippedManga {
-                        title: manga.title.clone(),
-                        chapters: manga.chapters.len(),
-                        history: manga.history.len(),
-                    });
-                }
                 continue;
             }
 
@@ -129,46 +113,24 @@ impl BackupWriter for AidokuConverter {
                 Err(err) => {
                     warn!(
                         title = %manga.title,
-                        source = source_key.2,
+                        source = manga.source.name,
                         error = %err,
                         "failed to match source; skipping this and subsequent manga from the same source"
                     );
-                    let label = format!(
-                        "{} ({})",
-                        manga.source.name.as_deref().unwrap_or("unknown"),
-                        manga.source.reader
-                    );
-                    let idx = skipped_sources.len();
-                    skipped_sources.push(SkippedSource {
-                        source_label: label,
-                        reason: "no matching Aidoku source found".to_string(),
-                        manga: vec![SkippedManga {
-                            title: manga.title.clone(),
-                            chapters: manga.chapters.len(),
-                            history: manga.history.len(),
-                        }],
-                    });
-                    skipped_index.insert(source_key.clone(), idx);
-                    failed_sources.insert(source_key);
+                    tracker.record_failure(manga, "no matching Aidoku source found");
                     continue;
                 }
             };
 
             let source_id = aidoku_source_id(&source, &manga.title)?;
 
-            if mapped_sources.insert(source_key.clone()) {
-                let from = format!(
-                    "{} ({})",
-                    manga.source.name.as_deref().unwrap_or("unknown"),
-                    manga.source.reader
-                );
-                let to = format!(
+            tracker.record_mapping(manga, || {
+                format!(
                     "{} ({})",
                     source.name.as_deref().unwrap_or(source_id.as_str()),
                     ReaderId::Aidoku
-                );
-                mappings.push(SourceMapping { from, to });
-            }
+                )
+            });
 
             if let Some(repo) = source.repo.as_ref()
                 && let Some(base_url) = repo.base_url.as_ref()
@@ -224,12 +186,11 @@ impl BackupWriter for AidokuConverter {
         source_ids.sort();
         let mut source_list_urls = source_list_urls.into_iter().collect::<Vec<_>>();
         source_list_urls.sort();
-        let skipped_manga: usize = skipped_sources.iter().map(|s| s.manga.len()).sum();
         info!(
             converted_manga = manga_items.len(),
             library_entries = library.len(),
             non_favorite_manga,
-            skipped_manga,
+            skipped_manga = tracker.skipped_manga_count(),
             sources = source_ids.len(),
             source_lists = source_list_urls.len(),
             "Finished building Aidoku backup data"
@@ -282,6 +243,7 @@ impl BackupWriter for AidokuConverter {
             PlistValue::String(AIDOKU_BACKUP_VERSION.into()),
         );
 
+        let (mappings, skipped_sources) = tracker.into_parts();
         let write_report = WriteReport {
             manga: manga_count,
             chapters: chapter_count,
@@ -476,7 +438,7 @@ fn library_entry_to_ir(
         cover_url: details.and_then(|manga| string_field(manga, "cover")),
         status: details
             .and_then(|manga| integer_field(manga, "status"))
-            .map(status_to_ir)
+            .map(MangaStatus::from_code)
             .unwrap_or_default(),
         nsfw: details
             .and_then(|manga| bool_field(manga, "nsfw"))
@@ -708,88 +670,15 @@ fn date_millis(value: &JsonValue) -> Option<i64> {
 }
 
 fn parse_rfc3339_millis(value: &str) -> Option<i64> {
-    let value = value.trim();
-    let value = value
-        .strip_suffix('Z')
-        .or_else(|| value.strip_suffix("+00:00"))
-        .unwrap_or(value);
-    let (date, time) = value.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year = date_parts.next()?.parse::<i32>().ok()?;
-    let month = date_parts.next()?.parse::<u32>().ok()?;
-    let day = date_parts.next()?.parse::<u32>().ok()?;
-
-    let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<u32>().ok()?;
-    let minute = time_parts.next()?.parse::<u32>().ok()?;
-    let second_part = time_parts.next()?;
-    let (second, millis) = if let Some((seconds, fraction)) = second_part.split_once('.') {
-        let second = seconds.parse::<u32>().ok()?;
-        let millis = fraction
-            .chars()
-            .take(3)
-            .chain(std::iter::repeat('0'))
-            .take(3)
-            .collect::<String>()
-            .parse::<u32>()
-            .ok()?;
-        (second, millis)
-    } else {
-        (second_part.parse::<u32>().ok()?, 0)
-    };
-
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day);
-    Some(
-        days * 86_400_000
-            + i64::from(hour) * 3_600_000
-            + i64::from(minute) * 60_000
-            + i64::from(second) * 1000
-            + i64::from(millis),
-    )
-}
-
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = i64::from(year) - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-fn status_to_ir(status: i64) -> MangaStatus {
-    match status {
-        1 => MangaStatus::Ongoing,
-        2 => MangaStatus::Completed,
-        3 => MangaStatus::Licensed,
-        4 => MangaStatus::PublishingFinished,
-        5 => MangaStatus::Cancelled,
-        6 => MangaStatus::OnHiatus,
-        _ => MangaStatus::Unknown,
-    }
-}
-
-fn status_to_aidoku(status: &MangaStatus) -> i64 {
-    match status {
-        MangaStatus::Unknown => 0,
-        MangaStatus::Ongoing => 1,
-        MangaStatus::Completed => 2,
-        MangaStatus::Licensed => 3,
-        MangaStatus::PublishingFinished => 4,
-        MangaStatus::Cancelled => 5,
-        MangaStatus::OnHiatus => 6,
-    }
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|dt| dt.timestamp_millis())
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
+                .ok()
+                .map(|dt| dt.and_utc().timestamp_millis())
+        })
 }
 
 fn aidoku_source_for_manga(manga: &Manga, matcher: &Matcher) -> Result<SourceData> {
@@ -904,7 +793,7 @@ fn manga_to_plist(manga: &Manga, source_id: &str) -> PlistValue {
     }
     item.insert(
         "status".into(),
-        PlistValue::Integer(status_to_aidoku(&manga.status).into()),
+        PlistValue::Integer(manga.status.code().into()),
     );
     item.insert(
         "nsfw".into(),
