@@ -1,3 +1,4 @@
+mod blacklist;
 mod converter;
 mod matching;
 mod reader;

@@ -2,9 +2,10 @@ use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
     Result,
 };
+use crate::blacklist;
 use crate::matching::{Language, Matcher, SourceData};
 use crate::reader::ReaderId;
-use crate::report::{ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
+use crate::report::{DroppedManga, ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
 use plist::{Dictionary, Value as PlistValue};
 use serde_json::{Map, Number, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
@@ -38,18 +39,29 @@ impl BackupReader for AidokuConverter {
         let histories = history_by_manga(root);
         let latest_history = latest_history_by_chapter(root)?;
 
-        let manga = array_field(root, "library")
-            .iter()
-            .map(|entry| {
-                library_entry_to_ir(
+        let mut manga = Vec::new();
+        let mut dropped = Vec::new();
+        for entry in array_field(root, "library") {
+            if let Some(source_id) = string_field(entry, "sourceId")
+                && let Some(reason) = blacklist::reason(ReaderId::Aidoku, &source_id)
+            {
+                dropped.push(dropped_for_entry(
                     entry,
+                    &source_id,
                     &manga_details,
                     &chapters,
-                    &histories,
-                    &latest_history,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    reason,
+                ));
+                continue;
+            }
+            manga.push(library_entry_to_ir(
+                entry,
+                &manga_details,
+                &chapters,
+                &histories,
+                &latest_history,
+            )?);
+        }
 
         Ok((
             Backup {
@@ -57,7 +69,7 @@ impl BackupReader for AidokuConverter {
                 manga,
                 categories: categories_to_ir(root),
             },
-            ReadReport::default(),
+            ReadReport { dropped },
         ))
     }
 }
@@ -493,6 +505,27 @@ fn library_entry_to_ir(
             .unwrap_or_default(),
         favorite: true,
     })
+}
+
+fn dropped_for_entry(
+    library_entry: &JsonObject,
+    source_id: &str,
+    manga_details: &HashMap<MangaKey, &JsonObject>,
+    chapters: &HashMap<MangaKey, Vec<&JsonObject>>,
+    reason: &str,
+) -> DroppedManga {
+    let manga_id = string_field(library_entry, "mangaId").unwrap_or_default();
+    let key = (source_id.to_owned(), manga_id.clone());
+    let title = manga_details
+        .get(&key)
+        .and_then(|manga| string_field(manga, "title"))
+        .unwrap_or(manga_id);
+
+    DroppedManga {
+        title,
+        reason: reason.to_string(),
+        chapters: chapters.get(&key).map_or(0, Vec::len),
+    }
 }
 
 fn chapter_to_ir(

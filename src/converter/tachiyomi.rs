@@ -2,6 +2,7 @@ use super::{
     Backup, BackupReader, BackupWriter, Category, Chapter, History, IRError, Manga, MangaStatus,
     Result,
 };
+use crate::blacklist;
 use crate::matching::{Matcher, SourceData, SourceRepo};
 use crate::reader::ReaderId;
 use crate::report::{DroppedManga, ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
@@ -16,21 +17,6 @@ pub struct TachiyomiConverter;
 #[allow(dead_code)]
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/tachiyomisy.backup.rs"));
-}
-
-const BLACKLISTED_SOURCE_IDS: &[i64] = &[
-    0,    // Local sources
-    6969, // Merged sources
-    6902, // Ex-h
-];
-
-fn blacklist_label(source_id: i64) -> &'static str {
-    match source_id {
-        0 => "Local",
-        6969 => "Merged",
-        6902 => "Ex-h",
-        _ => "blacklisted",
-    }
 }
 
 #[derive(Debug)]
@@ -57,17 +43,18 @@ impl BackupReader for TachiyomiConverter {
         let mut manga = Vec::new();
         let mut dropped = Vec::new();
         for m in backup.backup_manga {
-            if BLACKLISTED_SOURCE_IDS.contains(&m.source) {
+            if let Some(reason) = blacklist::reason(ReaderId::Tachiyomi, &m.source.to_string()) {
                 let title = m.title.clone().unwrap_or_else(|| m.url.clone());
                 warn!(
                     source_id = m.source,
                     manga_url = %m.url,
                     title = %title,
+                    reason,
                     "skipping Tachiyomi manga from blacklisted source"
                 );
                 dropped.push(DroppedManga {
                     title,
-                    reason: format!("unsupported source ({})", blacklist_label(m.source)),
+                    reason: reason.to_string(),
                     chapters: m.chapters.len(),
                 });
                 continue;
