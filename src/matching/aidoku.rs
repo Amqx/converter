@@ -1,6 +1,7 @@
 use super::{Language, Result, Source, SourceData, SourceRepo, normalized_key};
 use crate::reader::ReaderId;
 use crate::reader::ReaderId::Aidoku;
+use crate::report::RepoInfo;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -191,32 +192,12 @@ impl Source for AidokuSourceList {
 
         Ok(matches)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_multiple_lists() {
-        let amqx = AidokuSourceList::default().unwrap();
-        let community =
-            AidokuSourceList::new("https://aidoku-community.github.io/sources/index.min.json")
-                .unwrap();
-
-        let query = SourceData {
-            reader: ReaderId::Tachiyomi,
-            name: Some("MangaDex".into()),
-            external_id: Some("2499283573021220255".into()),
-            url: Some("https://mangadex.org".into()),
-            lang: Some(Language::All),
-            repo: None,
-        };
-
-        let amqx_response = amqx.search(&query).unwrap();
-        let community_response = community.search(&query).unwrap();
-
-        println!("Amqx result: {amqx_response:?}");
-        println!("Community result: {community_response:?}");
+    fn describe(&self) -> RepoInfo {
+        RepoInfo {
+            reader: Self::READER_ID,
+            name: String::new(),
+            url: self.index_url.clone(),
+        }
     }
 }

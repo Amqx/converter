@@ -4,11 +4,13 @@ use super::{
 };
 use crate::matching::{Language, Matcher, SourceData};
 use crate::reader::ReaderId;
+use crate::report::{ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
 use plist::{Dictionary, Value as PlistValue};
 use serde_json::{Map, Number, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime};
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, trace, warn};
 
 pub struct AidokuConverter;
@@ -28,7 +30,7 @@ struct ReadState {
 }
 
 impl BackupReader for AidokuConverter {
-    fn read_backup(bytes: &[u8]) -> Result<Backup> {
+    fn read_backup(bytes: &[u8]) -> Result<(Backup, ReadReport)> {
         let backup = parse_backup_bytes(bytes)?;
         let root = object(&backup, "Aidoku backup root")?;
         let manga_details = manga_details_by_key(root);
@@ -49,16 +51,19 @@ impl BackupReader for AidokuConverter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Backup {
-            reader: ReaderId::Aidoku,
-            manga,
-            categories: categories_to_ir(root),
-        })
+        Ok((
+            Backup {
+                reader: ReaderId::Aidoku,
+                manga,
+                categories: categories_to_ir(root),
+            },
+            ReadReport::default(),
+        ))
     }
 }
 
 impl BackupWriter for AidokuConverter {
-    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<(Vec<u8>, WriteReport)> {
         debug!(
             manga = backup.manga.len(),
             categories = backup.categories.len(),
@@ -72,8 +77,12 @@ impl BackupWriter for AidokuConverter {
         let mut manga_items = Vec::new();
         let mut chapter_items = Vec::new();
         let mut history_items = Vec::new();
-        let mut skipped_manga = 0usize;
         let mut non_favorite_manga = 0usize;
+        let mut mappings: Vec<SourceMapping> = Vec::new();
+        let mut mapped_sources: HashSet<(ReaderId, Option<String>, Option<String>)> = HashSet::new();
+        let mut skipped_sources: Vec<SkippedSource> = Vec::new();
+        let mut skipped_index: HashMap<(ReaderId, Option<String>, Option<String>), usize> =
+            HashMap::new();
 
         for manga in &backup.manga {
             trace!(
@@ -88,31 +97,66 @@ impl BackupWriter for AidokuConverter {
                 manga.source.name.clone(),
             );
             if failed_sources.contains(&source_key) {
-                skipped_manga += 1;
                 warn!(
                     title = %manga.title,
                     source = source_key.2,
                     "skipping manga because its Aidoku source previously failed to match"
                 );
+                if let Some(&idx) = skipped_index.get(&source_key) {
+                    skipped_sources[idx].manga.push(SkippedManga {
+                        title: manga.title.clone(),
+                        chapters: manga.chapters.len(),
+                        history: manga.history.len(),
+                    });
+                }
                 continue;
             }
 
             let source = match aidoku_source_for_manga(manga, matcher) {
                 Ok(source) => source,
                 Err(err) => {
-                    skipped_manga += 1;
                     warn!(
                         title = %manga.title,
                         source = source_key.2,
                         error = %err,
                         "failed to match source; skipping this and subsequent manga from the same source"
                     );
+                    let label = format!(
+                        "{} ({})",
+                        manga.source.name.as_deref().unwrap_or("unknown"),
+                        manga.source.reader
+                    );
+                    let idx = skipped_sources.len();
+                    skipped_sources.push(SkippedSource {
+                        source_label: label,
+                        reason: "no matching Aidoku source found".to_string(),
+                        manga: vec![SkippedManga {
+                            title: manga.title.clone(),
+                            chapters: manga.chapters.len(),
+                            history: manga.history.len(),
+                        }],
+                    });
+                    skipped_index.insert(source_key.clone(), idx);
                     failed_sources.insert(source_key);
                     continue;
                 }
             };
 
             let source_id = aidoku_source_id(&source, &manga.title)?;
+
+            if mapped_sources.insert(source_key.clone()) {
+                let from = format!(
+                    "{} ({})",
+                    manga.source.name.as_deref().unwrap_or("unknown"),
+                    manga.source.reader
+                );
+                let to = format!(
+                    "{} ({})",
+                    source.name.as_deref().unwrap_or(source_id.as_str()),
+                    ReaderId::Aidoku
+                );
+                mappings.push(SourceMapping { from, to });
+            }
 
             if let Some(repo) = source.repo.as_ref()
                 && let Some(base_url) = repo.base_url.as_ref()
@@ -168,6 +212,7 @@ impl BackupWriter for AidokuConverter {
         source_ids.sort();
         let mut source_list_urls = source_list_urls.into_iter().collect::<Vec<_>>();
         source_list_urls.sort();
+        let skipped_manga: usize = skipped_sources.iter().map(|s| s.manga.len()).sum();
         info!(
             converted_manga = manga_items.len(),
             library_entries = library.len(),
@@ -177,6 +222,13 @@ impl BackupWriter for AidokuConverter {
             source_lists = source_list_urls.len(),
             "Finished building Aidoku backup data"
         );
+
+        let manga_count = manga_items.len();
+        let chapter_count = chapter_items.len();
+        let history_count = history_items.len();
+        // Mirror the deduped category list actually written to the plist so the
+        // reported count matches the output exactly.
+        let category_count = categories_to_plist(backup).len();
 
         let mut root = Dictionary::new();
         root.insert("library".into(), PlistValue::Array(library));
@@ -218,13 +270,22 @@ impl BackupWriter for AidokuConverter {
             PlistValue::String(AIDOKU_BACKUP_VERSION.into()),
         );
 
+        let write_report = WriteReport {
+            manga: manga_count,
+            chapters: chapter_count,
+            history: history_count,
+            categories: category_count,
+            mappings,
+            skipped_sources,
+        };
+
         let mut bytes = Vec::new();
         PlistValue::Dictionary(root)
             .to_writer_binary(&mut bytes)
             .map_err(|err| IRError::Serialize(format!("failed to write Aidoku plist: {err}")))?;
 
         debug!(bytes = bytes.len(), "Finished serializing Aidoku backup");
-        Ok(bytes)
+        Ok((bytes, write_report))
     }
 }
 
@@ -262,7 +323,7 @@ fn plist_to_json(value: PlistValue) -> JsonValue {
         PlistValue::Boolean(value) => JsonValue::Bool(value),
         PlistValue::Date(value) => {
             let time: SystemTime = value.into();
-            JsonValue::Number(Number::from(system_time_to_millis(time)))
+            JsonValue::Number(Number::from(DateTime::<Utc>::from(time).timestamp_millis()))
         }
         PlistValue::Integer(value) => value.as_signed().map_or(JsonValue::Null, |value| {
             JsonValue::Number(Number::from(value))
@@ -846,7 +907,10 @@ fn chapter_to_plist(
     }
     item.insert(
         "lang".into(),
-        PlistValue::String(aidoku_lang_code(source_id)),
+        PlistValue::String(match source_id.split('.').next() {
+            Some(code) if !code.is_empty() && code != "multi" => code.to_owned(),
+            _ => String::new(),
+        }),
     );
     item.insert("chapter".into(), PlistValue::Real(chapter.chapter_number));
     if chapter.date_uploaded != 0 {
@@ -953,36 +1017,8 @@ fn insert_optional_string(dictionary: &mut Dictionary, key: &str, value: Option<
     }
 }
 
-fn aidoku_lang_code(source_id: &str) -> String {
-    match source_id.split('.').next() {
-        Some(code) if !code.is_empty() && code != "multi" => code.to_owned(),
-        _ => String::new(),
-    }
-}
-
 fn plist_date_from_millis(millis: i64) -> plist::Date {
-    let duration = Duration::from_millis(millis.saturating_abs() as u64);
-    let system_time = if millis >= 0 {
-        UNIX_EPOCH.checked_add(duration).unwrap_or(UNIX_EPOCH)
-    } else {
-        UNIX_EPOCH.checked_sub(duration).unwrap_or(UNIX_EPOCH)
-    };
-
-    plist::Date::from(system_time)
-}
-
-fn system_time_to_millis(time: SystemTime) -> i64 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration_to_millis(duration),
-        Err(err) => -duration_to_millis(err.duration()),
-    }
-}
-
-fn duration_to_millis(duration: Duration) -> i64 {
-    let millis = duration
-        .as_secs()
-        .saturating_mul(1000)
-        .saturating_add(u64::from(duration.subsec_millis()));
-
-    i64::try_from(millis).unwrap_or(i64::MAX)
+    let dt = DateTime::from_timestamp_millis(millis)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+    plist::Date::from(SystemTime::from(dt))
 }

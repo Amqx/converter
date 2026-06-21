@@ -1,6 +1,7 @@
 mod converter;
 mod matching;
 mod reader;
+mod report;
 
 use crate::converter::aidoku::AidokuConverter;
 use crate::converter::tachiyomi::TachiyomiConverter;
@@ -10,13 +11,15 @@ use crate::matching::aidoku::AidokuSourceList;
 use crate::matching::tachiyomi::TachiyomiExtensionRepo;
 use crate::reader::ReaderId;
 use crate::reader::ReaderId::{Aidoku, Tachiyomi};
+use crate::report::{ConversionReport};
 use clap::{ArgAction, ArgGroup, Parser};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use tracing::level_filters::LevelFilter;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
+use chrono::{Local};
 
 #[derive(Parser, Debug)]
 #[command(group(
@@ -142,8 +145,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let verbosity = args.verbose;
     let subscriber = FmtSubscriber::builder()
         .with_max_level(match verbosity {
-            0 => LevelFilter::INFO,
-            1 => LevelFilter::DEBUG,
+            0 => LevelFilter::WARN,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
             _ => LevelFilter::TRACE,
         })
         .finish();
@@ -200,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     debug!(bytes = input_file.len(), "Read input backup bytes");
 
     info!(input_format = ?input.kind, "Parsing input backup");
-    let input_backup = match input.kind {
+    let (input_backup, read_report) = match input.kind {
         Tachiyomi => TachiyomiConverter::read_backup(&input_file)?,
         Aidoku => AidokuConverter::read_backup(&input_file)?,
     };
@@ -217,7 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     info!(output_format = ?output.kind, "Serializing output backup");
-    let output_bytes = match output.kind {
+    let (output_bytes, write_report) = match output.kind {
         Tachiyomi => TachiyomiConverter::write_backup(&input_backup, &matcher)?,
         Aidoku => AidokuConverter::write_backup(&input_backup, &matcher)?,
     };
@@ -226,5 +230,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&output_path, output_bytes)?;
     info!("Wrote output backup to `{}`", output_path.display());
     info!("Finished backup conversion");
+
+    let report_path = {
+        let mut p = output_path.clone().into_os_string();
+        p.push(".report.txt");
+        PathBuf::from(p)
+    };
+    let report = ConversionReport {
+        timestamp: Local::now().format("%Y-%m-%d %H:%M %Z").to_string(),
+        input_file: input_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| input_path.display().to_string()),
+        output_file: output_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| output_path.display().to_string()),
+        from: input.kind,
+        to: output.kind,
+        repos: matcher.repos(),
+        read: read_report,
+        write: write_report,
+    };
+    match fs::write(&report_path, report.render()) {
+        Ok(()) => info!("Wrote conversion report to `{}`", report_path.display()),
+        Err(err) => warn!(
+            error = %err,
+            path = %report_path.display(),
+            "Failed to write conversion report (conversion itself succeeded)"
+        ),
+    }
+
     Ok(())
 }

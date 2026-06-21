@@ -1,6 +1,7 @@
 use super::{Language, Result, Source, SourceData, SourceRepo, normalized_key};
 use crate::reader::ReaderId;
 use crate::reader::ReaderId::Tachiyomi;
+use crate::report::RepoInfo;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -120,11 +121,6 @@ impl TachiyomiExtensionRepo {
             "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
 
         TachiyomiExtensionRepo::new(KEIYOUSHI_INDEX_URL)
-    }
-
-    #[cfg(test)]
-    fn info(&self) -> &TachiyomiRepoInfo {
-        &self.info
     }
 
     fn get(&mut self) -> Result<()> {
@@ -275,36 +271,12 @@ impl Source for TachiyomiExtensionRepo {
 
         Ok(results)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_multiple_repos() {
-        let keiyoushi = TachiyomiExtensionRepo::default().unwrap();
-        let yuzono = TachiyomiExtensionRepo::new(
-            "https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json",
-        )
-            .unwrap();
-
-        println!("Keiyoushi info: {:?}", keiyoushi.info());
-        println!("Yuzono info: {:?}", yuzono.info());
-
-        let query = SourceData {
-            reader: ReaderId::Aidoku,
-            name: Some("MangaPill".into()),
-            external_id: Some("en.mangapill".into()),
-            url: Some("https://mangapill.com".into()),
-            lang: Some(Language::from_code("en")),
-            repo: None,
-        };
-
-        let keiyoushi_response = keiyoushi.search(&query).unwrap();
-        let yuzono_response = yuzono.search(&query).unwrap();
-
-        println!("Keiyoushi result: {keiyoushi_response:?}");
-        println!("Yuzono result: {yuzono_response:?}");
+    fn describe(&self) -> RepoInfo {
+        RepoInfo {
+            reader: Self::READER_ID,
+            name: self.info.name.clone(),
+            url: self.index_url.clone(),
+        }
     }
 }

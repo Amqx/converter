@@ -1,4 +1,5 @@
 use crate::reader::ReaderId;
+use crate::report::RepoInfo;
 use std::fmt;
 use tracing::{debug, trace};
 
@@ -79,6 +80,8 @@ pub trait Source {
     fn reader_id(&self) -> ReaderId;
 
     fn search(&self, query: &SourceData) -> Result<Vec<SourceData>>;
+
+    fn describe(&self) -> RepoInfo;
 }
 
 pub struct Matcher {
@@ -100,6 +103,10 @@ impl Matcher {
 
     pub fn register_source(&mut self, source: Box<dyn Source>) {
         self.sources.push(source);
+    }
+
+    pub fn repos(&self) -> Vec<RepoInfo> {
+        self.sources.iter().map(|source| source.describe()).collect()
     }
 
     pub fn find_matches(&self, query: &SourceData) -> Result<Vec<SourceData>> {

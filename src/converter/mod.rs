@@ -1,5 +1,6 @@
 use crate::matching::{Matcher, SourceData};
 use crate::reader::ReaderId;
+use crate::report::{ReadReport, WriteReport};
 
 pub mod aidoku;
 pub mod tachiyomi;
@@ -109,9 +110,9 @@ pub enum IRError {
 pub type Result<T> = std::result::Result<T, IRError>;
 
 pub trait BackupReader {
-    fn read_backup(bytes: &[u8]) -> Result<Backup>;
+    fn read_backup(bytes: &[u8]) -> Result<(Backup, ReadReport)>;
 }
 
 pub trait BackupWriter {
-    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>>;
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<(Vec<u8>, WriteReport)>;
 }

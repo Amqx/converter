@@ -3,3 +3,6 @@
 *.aib
 *.tachibk
 *.json
+*.txt
+.venv
+.wslvenv

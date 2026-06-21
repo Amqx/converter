@@ -4,6 +4,7 @@ use super::{
 };
 use crate::matching::{Matcher, SourceData, SourceRepo};
 use crate::reader::ReaderId;
+use crate::report::{DroppedManga, ReadReport, SkippedManga, SkippedSource, SourceMapping, WriteReport};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,15 @@ const BLACKLISTED_SOURCE_IDS: &[i64] = &[
     6902, // Ex-h
 ];
 
+fn blacklist_label(source_id: i64) -> &'static str {
+    match source_id {
+        0 => "Local",
+        6969 => "Merged",
+        6902 => "Ex-h",
+        _ => "blacklisted",
+    }
+}
+
 #[derive(Debug)]
 struct TachiyomiSource {
     id: i64,
@@ -31,7 +41,7 @@ struct TachiyomiSource {
 }
 
 impl BackupReader for TachiyomiConverter {
-    fn read_backup(bytes: &[u8]) -> Result<Backup> {
+    fn read_backup(bytes: &[u8]) -> Result<(Backup, ReadReport)> {
         let bytes = decode(bytes)?;
         let backup = proto::Backup::decode(bytes.as_slice())?;
         let source_names = source_names_by_id(&backup.backup_sources);
@@ -44,35 +54,40 @@ impl BackupReader for TachiyomiConverter {
             .map(category_to_ir)
             .collect();
 
-        let manga = backup
-            .backup_manga
-            .into_iter()
-            .filter(|m| {
-                if BLACKLISTED_SOURCE_IDS.contains(&m.source) {
-                    warn!(
-                        source_id = m.source,
-                        manga_url = %m.url,
-                        title = m.title.as_deref().unwrap_or_default(),
-                        "skipping Tachiyomi manga from blacklisted source"
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .map(|m| manga_to_ir(m, &source_names, &category_lookup))
-            .collect();
+        let mut manga = Vec::new();
+        let mut dropped = Vec::new();
+        for m in backup.backup_manga {
+            if BLACKLISTED_SOURCE_IDS.contains(&m.source) {
+                let title = m.title.clone().unwrap_or_else(|| m.url.clone());
+                warn!(
+                    source_id = m.source,
+                    manga_url = %m.url,
+                    title = %title,
+                    "skipping Tachiyomi manga from blacklisted source"
+                );
+                dropped.push(DroppedManga {
+                    title,
+                    reason: format!("unsupported source ({})", blacklist_label(m.source)),
+                    chapters: m.chapters.len(),
+                });
+                continue;
+            }
+            manga.push(manga_to_ir(m, &source_names, &category_lookup));
+        }
 
-        Ok(Backup {
-            reader: ReaderId::Tachiyomi,
-            manga,
-            categories,
-        })
+        Ok((
+            Backup {
+                reader: ReaderId::Tachiyomi,
+                manga,
+                categories,
+            },
+            ReadReport { dropped },
+        ))
     }
 }
 
 impl BackupWriter for TachiyomiConverter {
-    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<Vec<u8>> {
+    fn write_backup(backup: &Backup, matcher: &Matcher) -> Result<(Vec<u8>, WriteReport)> {
         debug!(
             manga = backup.manga.len(),
             categories = backup.categories.len(),
@@ -87,7 +102,11 @@ impl BackupWriter for TachiyomiConverter {
 
         let mut failed_sources = HashSet::new();
         let mut backup_manga = Vec::new();
-        let mut skipped_manga = 0usize;
+        let mut mappings: Vec<SourceMapping> = Vec::new();
+        let mut mapped_sources: HashSet<(ReaderId, Option<String>, Option<String>)> = HashSet::new();
+        let mut skipped_sources: Vec<SkippedSource> = Vec::new();
+        let mut skipped_index: HashMap<(ReaderId, Option<String>, Option<String>), usize> =
+            HashMap::new();
         for manga in &backup.manga {
             trace!(
                 title = %manga.title,
@@ -101,28 +120,66 @@ impl BackupWriter for TachiyomiConverter {
                 manga.source.name.clone(),
             );
             if failed_sources.contains(&source_key) {
-                skipped_manga += 1;
                 warn!(
                     title = %manga.title,
                     source = source_key.2,
                     "skipping manga because its source previously failed to match"
                 );
+                if let Some(&idx) = skipped_index.get(&source_key) {
+                    skipped_sources[idx].manga.push(SkippedManga {
+                        title: manga.title.clone(),
+                        chapters: manga.chapters.len(),
+                        history: manga.history.len(),
+                    });
+                }
                 continue;
             }
             let tachiyomi_source = match tachiyomi_source_for_manga(manga, matcher) {
                 Ok(source) => source,
                 Err(err) => {
-                    skipped_manga += 1;
                     warn!(
                         title = %manga.title,
                         source = source_key.2,
                         error = %err,
                         "failed to match source; skipping this and subsequent manga from the same source"
                     );
+                    let label = format!(
+                        "{} ({})",
+                        manga.source.name.as_deref().unwrap_or("unknown"),
+                        manga.source.reader
+                    );
+                    let idx = skipped_sources.len();
+                    skipped_sources.push(SkippedSource {
+                        source_label: label,
+                        reason: "no matching Tachiyomi source found".to_string(),
+                        manga: vec![SkippedManga {
+                            title: manga.title.clone(),
+                            chapters: manga.chapters.len(),
+                            history: manga.history.len(),
+                        }],
+                    });
+                    skipped_index.insert(source_key.clone(), idx);
                     failed_sources.insert(source_key);
                     continue;
                 }
             };
+
+            if mapped_sources.insert(source_key.clone()) {
+                let from = format!(
+                    "{} ({})",
+                    manga.source.name.as_deref().unwrap_or("unknown"),
+                    manga.source.reader
+                );
+                let to = format!(
+                    "{} ({})",
+                    tachiyomi_source
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| tachiyomi_source.id.to_string()),
+                    ReaderId::Tachiyomi
+                );
+                mappings.push(SourceMapping { from, to });
+            }
 
             if source_ids.insert(tachiyomi_source.id) {
                 backup_sources.push(proto::BackupSource {
@@ -146,6 +203,7 @@ impl BackupWriter for TachiyomiConverter {
             .enumerate()
             .map(category_to_proto)
             .collect();
+        let skipped_manga: usize = skipped_sources.iter().map(|s| s.manga.len()).sum();
         info!(
             converted_manga = backup_manga.len(),
             skipped_manga,
@@ -153,6 +211,32 @@ impl BackupWriter for TachiyomiConverter {
             extension_repos = backup_extension_repo.len(),
             "Finished building Tachiyomi backup data"
         );
+
+        // Sum chapters and history over the manga that were actually converted
+        // (their source wasn't in `failed_sources`) in a single pass.
+        let (converted_chapters, converted_history) = backup
+            .manga
+            .iter()
+            .filter(|m| {
+                let key = (
+                    m.source.reader,
+                    m.source.external_id.clone(),
+                    m.source.name.clone(),
+                );
+                !failed_sources.contains(&key)
+            })
+            .fold((0usize, 0usize), |(chapters, history), m| {
+                (chapters + m.chapters.len(), history + m.history.len())
+            });
+
+        let write_report = WriteReport {
+            manga: backup_manga.len(),
+            chapters: converted_chapters,
+            history: converted_history,
+            categories: backup.categories.len(),
+            mappings,
+            skipped_sources,
+        };
 
         let proto_backup = proto::Backup {
             backup_manga,
@@ -166,7 +250,7 @@ impl BackupWriter for TachiyomiConverter {
 
         let bytes = encode(&proto_backup)?;
         debug!(bytes = bytes.len(), "Finished serializing Tachiyomi backup");
-        Ok(bytes)
+        Ok((bytes, write_report))
     }
 }
 
