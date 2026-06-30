@@ -2,10 +2,13 @@ use super::{Language, Result, Source, SourceData, SourceRepo, normalized_key};
 use crate::reader::ReaderId;
 use crate::reader::ReaderId::Tachiyomi;
 use crate::report::RepoInfo;
+use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Read;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 struct TachiyomiEntry {
@@ -13,6 +16,9 @@ struct TachiyomiEntry {
     url: String,
     id: i64,
     lang: Language,
+
+    /// New TachiyomiX mirrors
+    mirrors: Vec<String>,
 }
 impl fmt::Display for TachiyomiEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -37,6 +43,7 @@ impl TachiyomiEntry {
     }
 }
 
+// Legacy format (pre Tachiyomix 1.6)
 #[derive(Deserialize, Debug)]
 struct TachiyomiIndex {
     lang: Option<String>,
@@ -63,6 +70,56 @@ struct TachiyomiRepoMeta {
     website: String,
     #[serde(rename = "signingKeyFingerprint")]
     signing_key: String,
+}
+
+// New format (post Tachiyomix 1.6)
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct TachiyomixIndex {
+    name: String,
+    badge_label: Option<String>,
+    signing_key: Option<String>,
+    contact: Option<TachiyomixContact>,
+    // `oneof extensions`: an inline list or a URL pointing at one.
+    extension_list: Option<TachiyomixExtensionList>,
+    extension_list_url: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TachiyomixContact {
+    website: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TachiyomixExtensionList {
+    #[serde(default)]
+    extensions: Vec<TachiyomixExtension>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TachiyomixExtension {
+    #[serde(default)]
+    sources: Vec<TachiyomixSource>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct TachiyomixSource {
+    name: String,
+    id: String,
+    language: Option<String>,
+    home_url: String,
+    #[serde(default)]
+    mirror_urls: Vec<String>,
+}
+
+/// The legacy format's top-level is an array, while the new format's is an object.
+/// Use Serde to try each variant at a time.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum TachiyomiIndexFile {
+    Legacy(Vec<TachiyomiIndex>),
+    Store(Box<TachiyomixIndex>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,15 +185,38 @@ impl TachiyomiExtensionRepo {
             .user_agent("Tachiyomi-Source-Fetcher")
             .build()?;
 
-        self.get_repo_info(&client)?;
+        let bytes = fetch_json_bytes(&client, &self.index_url)?;
 
-        let sources: Vec<TachiyomiIndex> = client
-            .get(&self.index_url)
-            .send()?
-            .error_for_status()?
-            .json()?;
+        match serde_json::from_slice::<TachiyomiIndexFile>(&bytes)? {
+            TachiyomiIndexFile::Legacy(indexes) => {
+                self.get_repo_info(&client)?;
+                self.load_indexes(indexes)?;
+            }
+            TachiyomiIndexFile::Store(index) => {
+                let index = *index;
+                self.set_store_repo_info(&index);
 
-        self.load_indexes(sources)
+                let list = if let Some(list) = index.extension_list {
+                    list
+                } else if let Some(url) = index.extension_list_url {
+                    let bytes = fetch_json_bytes(&client, &url)?;
+                    serde_json::from_slice::<TachiyomixExtensionList>(&bytes)?
+                } else {
+                    warn!(
+                        url = %self.index_url,
+                        "TachiyomiX store has neither an inline extension list nor a list URL"
+                    );
+                    TachiyomixExtensionList {
+                        extensions: Vec::new(),
+                    }
+                };
+
+                self.load_store(list)?;
+            }
+        }
+
+        self.build_lookup();
+        Ok(())
     }
 
     fn repo_info_url(&self) -> String {
@@ -164,6 +244,27 @@ impl TachiyomiExtensionRepo {
         Ok(())
     }
 
+    /// New Tachiyomix 1.6 repo metadata
+    fn set_store_repo_info(&mut self, index: &TachiyomixIndex) {
+        let short_name = index
+            .badge_label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .unwrap_or(index.name.as_str());
+
+        self.info = TachiyomiRepoInfo {
+            base_url: self.index_url.clone(),
+            short_name: normalized_key(short_name),
+            name: index.name.clone(),
+            website: index
+                .contact
+                .as_ref()
+                .and_then(|contact| contact.website.clone())
+                .unwrap_or_default(),
+            signing_key: index.signing_key.clone().unwrap_or_default(),
+        };
+    }
+
     fn load_indexes(&mut self, sources: Vec<TachiyomiIndex>) -> Result<()> {
         for extension in sources {
             let extension_lang = extension.lang.as_deref().map(Language::from_code);
@@ -181,10 +282,38 @@ impl TachiyomiExtensionRepo {
                     url: source.base_url,
                     id: source.id.parse::<i64>()?,
                     lang,
+                    mirrors: Vec::new(),
                 });
             }
         }
 
+        Ok(())
+    }
+
+    /// Flatten a new-format store's nested `extensions[].sources[]` into entries.
+    fn load_store(&mut self, list: TachiyomixExtensionList) -> Result<()> {
+        for extension in list.extensions {
+            for source in extension.sources {
+                let lang = source
+                    .language
+                    .as_deref()
+                    .map(Language::from_code)
+                    .unwrap_or(Language::All);
+
+                self.entries.push(TachiyomiEntry {
+                    name: source.name,
+                    url: source.home_url,
+                    id: source.id.parse::<i64>()?,
+                    lang,
+                    mirrors: source.mirror_urls,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_lookup(&mut self) {
         for (idx, entry) in self.entries.iter().enumerate() {
             self.by_name
                 .entry(normalized_key(&entry.name))
@@ -195,12 +324,17 @@ impl TachiyomiExtensionRepo {
                 .entry(normalized_key(&entry.url))
                 .or_default()
                 .push(idx);
+            for mirror in &entry.mirrors {
+                self.by_url
+                    .entry(normalized_key(mirror))
+                    .or_default()
+                    .push(idx);
+            }
 
             self.by_id.insert(entry.id, idx);
         }
-
-        Ok(())
     }
+
     fn push_entry_indexes(
         results: &mut Vec<SourceData>,
         seen_ids: &mut HashSet<i64>,
@@ -278,5 +412,27 @@ impl Source for TachiyomiExtensionRepo {
             name: self.info.name.clone(),
             url: self.index_url.clone(),
         }
+    }
+}
+
+fn fetch_json_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
+    let bytes = client
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .bytes()?
+        .to_vec();
+    maybe_gunzip(bytes)
+}
+
+fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+    if bytes.starts_with(&GZIP_MAGIC) {
+        let mut decoder = GzDecoder::new(bytes.as_slice());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded)?;
+        Ok(decoded)
+    } else {
+        Ok(bytes)
     }
 }
