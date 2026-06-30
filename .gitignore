@@ -6,3 +6,5 @@
 *.txt
 .venv
 .wslvenv
+.DS_STORE
+tachiyomix/
