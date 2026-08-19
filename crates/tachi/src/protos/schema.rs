@@ -109,7 +109,7 @@ async fn list(client: &reqwest::Client, url: &str) -> Result<Vec<Entry>, SchemaE
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Every `.kt` under the models directory, one subdirectory deep
+/// Every `.kt` under the models directory, one subdirectory deep.
 async fn fetch_models() -> Result<Vec<(String, String)>, SchemaError> {
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
 

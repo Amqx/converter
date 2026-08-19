@@ -1,5 +1,6 @@
 pub mod lang;
 pub mod matcher;
+pub mod matching;
 pub mod types;
 
 use thiserror::Error;

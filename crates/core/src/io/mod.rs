@@ -27,4 +27,8 @@ pub enum ReadError {
 }
 
 #[derive(Error, Debug)]
-pub enum WriteError {}
+pub enum WriteError {
+    /// The backup was assembled but the app's container would not take it.
+    #[error("could not encode the backup: {0}")]
+    Encode(String),
+}

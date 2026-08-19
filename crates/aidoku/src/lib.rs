@@ -1,3 +1,14 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::float_cmp
+    )
+)]
+
 use crate::reader::AidokuReader;
 use crate::sources::Amqx;
 use crate::writer::AidokuWriter;

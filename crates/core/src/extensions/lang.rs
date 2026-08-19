@@ -2,7 +2,7 @@ use crate::extensions::{ExtResult, ExtensionError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Language {
-    /// BCP-47 style tags: a primary language, plus the script and region
+    /// BCP-47 style tags: a primary language, plus the script and region.
     Tagged {
         iso: isolang::Language,
         /// Script subtag in canonical Titlecase, e.g. `Hans`.
@@ -11,6 +11,11 @@ pub enum Language {
         region: Option<String>,
     },
     All,
+    /// The backup never said. Distinct from [`Self::All`], which is a claim the source makes
+    /// about itself: some formats (Tachiyomi's `backupSources`) carry no language field at all,
+    /// and scoring an absence as if it were "serves every language" penalises every candidate.
+    /// `from_code` never produces this - a code that parses is always an answer.
+    Unknown,
 }
 
 /// No two apps spell "this source serves every language" the same way.
@@ -58,7 +63,9 @@ impl Language {
     /// falling back to 639-3 for languages that don't have one.
     pub fn to_code(&self) -> String {
         match self {
-            Self::All => "all".to_string(),
+            // A writer has to put *something* in the field, and "all" is the one code every app
+            // reads as "do not filter on this" - the closest thing to saying nothing.
+            Self::All | Self::Unknown => "all".to_string(),
             Self::Tagged {
                 iso,
                 script,
@@ -99,6 +106,7 @@ impl std::fmt::Display for Language {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::All => write!(f, "Multilingual (all)"),
+            Self::Unknown => write!(f, "Unknown"),
             Self::Tagged {
                 iso,
                 script,

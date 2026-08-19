@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::sync::Arc;
 
-use converter_core::ReaderID;
 use converter_core::extensions::lang::Language;
 use converter_core::extensions::types::{Extension, ExtensionRepositoryInfo};
 use converter_core::io::reader::{BackupReader, ReadReport};
@@ -22,6 +21,9 @@ use crate::protos;
 const LOCAL_SOURCE_ID: i64 = 0;
 /// SY's stand-in source for merged entries.
 const MERGED_SOURCE_ID: i64 = 6969;
+/// A backup is protobuf, not media: even a large library is a few tens of megabytes decompressed,
+/// so anything past this is a decompression bomb rather than someone's collection.
+const MAX_DECOMPRESSED: usize = 512 * 1024 * 1024;
 
 pub struct TachiReader {}
 
@@ -38,9 +40,7 @@ impl Default for TachiReader {
 }
 
 impl BackupReader for TachiReader {
-    fn reader(&self) -> ReaderID {
-        Tachiyomi::ID
-    }
+    converter_core::format_id!(Tachiyomi);
 
     fn read_backup(&self, bytes: &[u8]) -> Result<(Backup, ReadReport), ReadError> {
         let raw = decompress(bytes)?;
@@ -50,16 +50,31 @@ impl BackupReader for TachiReader {
     }
 }
 
-/// A `.tachibk` (and a `.proto.gz`) is gzipped, so we decompress it
+/// A `.tachibk` (and a `.proto.gz`) is gzipped; anything already decoded passes through.
 fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>, ReadError> {
+    decompress_within(bytes, MAX_DECOMPRESSED)
+}
+
+/// Split out from [`decompress`] so a test can pass a limit it can actually reach.
+fn decompress_within(bytes: &[u8], max: usize) -> Result<Cow<'_, [u8]>, ReadError> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
         return Ok(Cow::Borrowed(bytes));
     }
 
+    // The input is a file the user picked, so a corrupt or hostile one would otherwise expand
+    // until allocation fails and takes the process down. Reading one byte past the cap is what
+    // tells the two cases apart: a backup that stops short of it decompressed cleanly.
     let mut out = Vec::new();
-    GzDecoder::new(bytes)
+    let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    let read = GzDecoder::new(bytes)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut out)
         .map_err(|error| ReadError::Decompress(error.to_string()))?;
+    if read > max {
+        return Err(ReadError::Decompress(format!(
+            "backup expands past the {max} byte limit"
+        )));
+    }
     Ok(Cow::Owned(out))
 }
 
@@ -117,13 +132,18 @@ impl Sources {
             reported: HashSet::new(),
         };
 
+        // Registering in `backupSources` order, not `names` key order: the app writes sources in
+        // the order its entries first mention them, and a `HashMap`'s keys come back in a
+        // different arbitrary order every run, which would reshuffle `Backup::extensions` between
+        // two reads of the same file. Names go in first because `extension_for` reads them.
+        let mut listed = Vec::with_capacity(wire.len());
         for source in wire {
+            listed.push(source.source_id);
             sources
                 .names
                 .insert(source.source_id, source.name.unwrap_or_default());
         }
 
-        let listed: Vec<i64> = sources.names.keys().copied().collect();
         for id in listed {
             if synthetic_reason(id).is_none() {
                 sources.register(id);
@@ -169,7 +189,10 @@ impl Sources {
             name: self.names.get(&id).cloned().unwrap_or_default(),
             external_id: id.to_string(),
             url: String::new(),
-            lang: Language::All,
+            // `backupSources` is only a name and an id. The id is an md5 of name/lang/version,
+            // so the language is in there but not recoverable, and claiming `All` would cost
+            // every candidate the multilingual penalty for something the backup never said.
+            lang: Language::Unknown,
             repo: ExtensionRepositoryInfo::new(Tachiyomi::ID, None, None, None, None),
         }
     }
@@ -575,6 +598,87 @@ mod tests {
         let (from_gzipped, _) = reader.read_backup(&gzipped).unwrap();
 
         assert_eq!(from_bare, from_gzipped);
+    }
+
+    #[test]
+    fn extensions_keep_the_order_backup_sources_listed_them_in() {
+        // `Sources::order` used to be seeded from a `HashMap`'s keys, which come back in a
+        // different arbitrary order every run: two reads of one file disagreed on
+        // `Backup::extensions`, and any writer emitting sources in list order inherited that.
+        let listed: Vec<i64> = (1..=12).collect();
+        let wire = protos::Backup {
+            backup_sources: listed.iter().map(|id| source(*id, "Source")).collect(),
+            ..Default::default()
+        };
+        let expected: Vec<String> = listed.iter().map(i64::to_string).collect();
+
+        for _ in 0..8 {
+            let (backup, _) = read(&wire);
+            let seen: Vec<String> = backup
+                .extensions
+                .iter()
+                .map(|extension| extension.external_id.clone())
+                .collect();
+            assert_eq!(seen, expected);
+        }
+    }
+
+    #[test]
+    fn an_entry_only_extends_the_order_it_does_not_reshuffle_it() {
+        // Ids met for the first time on an entry land after the listed ones, in entry order.
+        let wire = protos::Backup {
+            backup_sources: vec![source(3, "C"), source(1, "A")],
+            backup_manga: vec![manga(7, "/a"), manga(1, "/b"), manga(5, "/c")],
+            ..Default::default()
+        };
+
+        let (backup, _) = read(&wire);
+
+        let seen: Vec<&str> = backup
+            .extensions
+            .iter()
+            .map(|extension| extension.external_id.as_str())
+            .collect();
+        assert_eq!(seen, ["3", "1", "7", "5"]);
+    }
+
+    #[test]
+    fn a_decompression_bomb_errors_instead_of_exhausting_memory() {
+        // Unbounded, this is the input that ends the process rather than the read.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0u8; 64 * 1024]).unwrap();
+        let bomb = encoder.finish().unwrap();
+
+        let error = decompress_within(&bomb, 1024).expect_err("should refuse to expand past 1KiB");
+
+        assert!(matches!(error, ReadError::Decompress(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_backup_that_fits_the_limit_still_decompresses_whole() {
+        // The cap must not truncate: exactly-at-the-limit is a legitimate backup, not a bomb.
+        let payload = vec![7u8; 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        let out = decompress_within(&gzipped, 1024).expect("1KiB should fit a 1KiB limit");
+
+        assert_eq!(out.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn a_source_without_a_language_reads_as_unknown_not_all() {
+        // `backupSources` has no language field. `All` is a claim ("serves every language") that
+        // costs the source a scoring penalty against every candidate; `Unknown` is the absence.
+        let wire = protos::Backup {
+            backup_sources: vec![source(9001, "Batoto")],
+            ..Default::default()
+        };
+
+        let (backup, _) = read(&wire);
+
+        assert_eq!(backup.extensions[0].lang, Language::Unknown);
     }
 
     #[test]

@@ -5,6 +5,14 @@ edition.workspace = true
 
 [dependencies]
 converter-core = { path = "../core" }
+jiff = { workspace = true }
+plist = "1.10"
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
 //! The Tachiyomi backup wire format, as `TachiyomiSY` writes it.
 //!
 //! [`tachiyomisy`] is generated: `tachiyomisy.proto` is scraped out of SY's Kotlin models and
-//! compiled by prost. Neither file is hand-edited — see [`schema`] for how to refresh them.
+//! compiled by prost. Neither file is hand-edited - see [`schema`] for how to refresh them.
 
 #[cfg(test)]
 mod schema;

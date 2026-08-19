@@ -2,6 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use converter_core::extensions::lang::Language;
+use converter_core::extensions::matching::{
+    host_of, language_agreement, name_key, name_similarity, same_site,
+};
 use converter_core::extensions::types::{
     Extension, ExtensionMatch, ExtensionQuery, ExtensionRepository, ExtensionRepositoryInfo,
     RefreshFuture,
@@ -16,7 +19,7 @@ const MAX_INFERRED_SCORE: f32 = 0.95;
 const NEUTRAL_SCORE: f32 = 0.5;
 const URL_AGREEMENT: f32 = 0.6;
 const URL_DISAGREEMENT: f32 = 0.85;
-/// How alike the names have to look before we trust a matching id
+/// How alike the names have to look before we trust a matching id.
 const ID_CORROBORATION: f32 = 0.4;
 
 pub struct Keiyoushi {
@@ -77,7 +80,7 @@ impl Keiyoushi {
             })
     }
 
-    /// Replaces the index with what Keiyoushi's json describes
+    /// Replaces the index with what Keiyoushi's json describes.
     fn load(&mut self, json: &str) -> ExtResult<()> {
         let index: RepoIndex =
             serde_json::from_str(json).map_err(|error| ExtensionError::MalformedIndex {
@@ -113,7 +116,7 @@ impl Keiyoushi {
         Ok(())
     }
 
-    /// Returns `None` for a source we couldn't map onto
+    /// Returns `None` for a source we couldn't map onto.
     fn indexed(info: &ExtensionRepositoryInfo, source: IndexSource) -> Option<IndexedSource> {
         let external_id = source.id.into_string();
         if external_id.is_empty() || source.name.is_empty() {
@@ -231,117 +234,7 @@ fn score(source: &IndexedSource, query: &ExtensionQuery) -> f32 {
 }
 
 fn language_factor(source: &Language, wanted: Option<&Language>) -> f32 {
-    let Some(wanted) = wanted else { return 1.0 };
-
-    match (source, wanted) {
-        (a, b) if a == b => 1.0,
-        (Language::All, _) | (_, Language::All) => 0.95,
-        (Language::Tagged { iso: a, .. }, Language::Tagged { iso: b, .. }) if a == b => 0.85,
-        // Kept, but nowhere near where a policy would take it unattended.
-        _ => 0.4,
-    }
-}
-
-/// Lowercase alphanumerics only, minus the app prefix some repos put in front
-fn name_key(name: &str) -> String {
-    let trimmed = name.trim();
-    let stripped = ["tachiyomi:", "mihon:", "aidoku:"]
-        .iter()
-        .find_map(|prefix| {
-            trimmed
-                .get(..prefix.len())
-                .filter(|start| start.eq_ignore_ascii_case(prefix))
-                .map(|_| &trimmed[prefix.len()..])
-        })
-        .unwrap_or(trimmed);
-
-    stripped
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-/// 1.0 for identical names, tapering to 0.0 as the edit distance approaches the
-/// length of the longer one.
-fn name_similarity(a: &str, b: &str) -> f32 {
-    if a == b {
-        return 1.0;
-    }
-
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let longest = a.len().max(b.len());
-    if longest == 0 {
-        return 0.0;
-    }
-
-    let distance = f32::from(u16::try_from(levenshtein(&a, &b)).unwrap_or(u16::MAX));
-    let longest = f32::from(u16::try_from(longest).unwrap_or(u16::MAX));
-
-    1.0 - distance / longest
-}
-
-fn levenshtein(a: &[char], b: &[char]) -> usize {
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-
-    for (i, from) in a.iter().enumerate() {
-        let mut current = Vec::with_capacity(previous.len());
-        current.push(i + 1);
-
-        for ((to, &deletion), &substitution) in
-            b.iter().zip(previous.iter().skip(1)).zip(previous.iter())
-        {
-            let insertion = current.last().copied().unwrap_or(i + 1);
-            current.push(
-                (substitution + usize::from(from != to))
-                    .min(deletion + 1)
-                    .min(insertion + 1),
-            );
-        }
-
-        previous = current;
-    }
-
-    previous.last().copied().unwrap_or(0)
-}
-
-/// The bare host of a url
-fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url
-        .trim()
-        .split_once("://")
-        .map_or_else(|| url.trim(), |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next()?;
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let host = host.split_once(':').map_or(host, |(host, _)| host);
-    let host = host.trim_end_matches('.').to_lowercase();
-    let host = host.trim_start_matches("www.");
-
-    (!host.is_empty()).then(|| host.to_string())
-}
-
-const SECOND_LEVEL_SUFFIXES: [&str; 9] =
-    ["com", "co", "net", "org", "edu", "gov", "ac", "ne", "or"];
-
-/// Whether two hosts look like the same site wearing a different tld
-fn same_site(a: &str, b: &str) -> bool {
-    fn site_label(host: &str) -> Option<&str> {
-        let mut labels = host.rsplit('.');
-        labels.next()?;
-        let candidate = labels.next()?;
-        let label = if SECOND_LEVEL_SUFFIXES.contains(&candidate) {
-            labels.next()?
-        } else {
-            candidate
-        };
-
-        (label.len() >= 3).then_some(label)
-    }
-
-    matches!((site_label(a), site_label(b)), (Some(a), Some(b)) if a == b)
+    wanted.map_or(1.0, |wanted| language_agreement(source, wanted))
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -692,41 +585,6 @@ mod tests {
         query.name = Some("MangaDex (RU)".into());
 
         assert_eq!(best(&loaded(), &query).score, 1.0);
-    }
-
-    #[test]
-    fn hosts_normalize_before_they_are_compared() {
-        assert_eq!(
-            host_of("https://WWW.MangaDex.org:443/titles?x=1"),
-            host_of("mangadex.org")
-        );
-        assert_eq!(
-            host_of("https://user:pw@mangadex.org/"),
-            host_of("https://mangadex.org")
-        );
-        assert!(host_of("https://").is_none());
-        assert!(same_site("mangadex.org", "mangadex.to"));
-        assert!(same_site("api.comick.live", "comick.live"));
-        assert!(!same_site("mangadex.org", "comick.live"));
-        // `com.br` and friends are suffix, not site: these are six different
-        // scanlation groups, not one wearing six tlds.
-        assert!(!same_site("tsundoku.com.br", "cafecomyaoi.com.br"));
-        assert!(!same_site("asurascans.com.tr", "holyscans.com.tr"));
-        assert!(!same_site("alphapolis.co.jp", "book.dmm.co.jp"));
-        assert!(!same_site("mangadex.co.uk", "comick.co.uk"));
-        // ...while a site that really did move tlds still lines up.
-        assert!(same_site("asurascans.com.tr", "asurascans.net"));
-        assert!(same_site("leitor.kamisama.com.br", "kamisama.org"));
-    }
-
-    #[test]
-    fn names_normalize_before_they_are_compared() {
-        assert_eq!(name_key("Tachiyomi: MangaDex"), name_key("manga-dex"));
-        assert_eq!(
-            name_similarity(&name_key("MangaDex"), &name_key("mangadex")),
-            1.0
-        );
-        assert!(name_similarity(&name_key("MangaDex"), &name_key("MangaPark")) < 0.8);
     }
 
     /// Against the real index, so a schema change surfaces here rather than as
