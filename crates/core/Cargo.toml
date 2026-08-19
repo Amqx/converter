@@ -1,0 +1,9 @@
+[package]
+name = "converter-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+isolang = "2.4.0"
+jiff = "0.2.35"
