@@ -19,7 +19,7 @@ pub struct RefreshReport {
 }
 
 impl RefreshReport {
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.failed.is_empty()
     }
 }
@@ -46,9 +46,10 @@ impl ExtensionMatcher {
         for repo in &mut self.extension_repos {
             match repo.refresh().await {
                 Ok(()) => report.refreshed.push(repo.info().clone()),
-                Err(error) => {
-                    report.failed.push(FailedRepository { repo: repo.info().clone(), error })
-                }
+                Err(error) => report.failed.push(FailedRepository {
+                    repo: repo.info().clone(),
+                    error,
+                }),
             }
         }
 
@@ -143,11 +144,20 @@ mod tests {
 
     impl StubRepo {
         fn new(info: ExtensionRepositoryInfo, index: Vec<Arc<Extension>>) -> Self {
-            Self { info, index, score: 1.0, refresh_fails: false, refreshed: false }
+            Self {
+                info,
+                index,
+                score: 1.0,
+                refresh_fails: false,
+                refreshed: false,
+            }
         }
 
         fn failing(info: ExtensionRepositoryInfo) -> Self {
-            Self { refresh_fails: true, ..Self::new(info, Vec::new()) }
+            Self {
+                refresh_fails: true,
+                ..Self::new(info, Vec::new())
+            }
         }
 
         fn scoring(mut self, score: f32) -> Self {
@@ -165,7 +175,10 @@ mod tests {
             Ok(self
                 .index
                 .iter()
-                .map(|e| ExtensionMatch { extension: e.clone(), score: self.score })
+                .map(|e| ExtensionMatch {
+                    extension: Arc::clone(e),
+                    score: self.score,
+                })
                 .collect())
         }
 
@@ -194,10 +207,10 @@ mod tests {
             vec![extension(&community, "MangaDex", "mangadex")],
         )));
 
-        let matches = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
+        let found = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].extension.repo, official);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].extension.repo, official);
     }
 
     #[test]
@@ -214,11 +227,11 @@ mod tests {
             vec![extension(&strong, "MangaDex", "mangadex")],
         )));
 
-        let matches = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
+        let found = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].score, 1.0);
-        assert_eq!(matches[0].extension.repo, strong);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].score, 1.0);
+        assert_eq!(found[0].extension.repo, strong);
     }
 
     #[test]
@@ -233,7 +246,13 @@ mod tests {
             ],
         )));
 
-        assert_eq!(matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap().len(), 2);
+        assert_eq!(
+            matcher
+                .find_matches(&ExtensionQuery::new(AIDOKU))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -245,7 +264,12 @@ mod tests {
             vec![extension(&tachi, "MangaDex", "mangadex")],
         )));
 
-        assert!(matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap().is_empty());
+        assert!(
+            matcher
+                .find_matches(&ExtensionQuery::new(AIDOKU))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -266,7 +290,13 @@ mod tests {
         assert_eq!(report.failed[0].repo, broken);
         assert_eq!(report.refreshed, vec![working]);
         // ...and the one queued behind it still ran.
-        assert_eq!(matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap().len(), 1);
+        assert_eq!(
+            matcher
+                .find_matches(&ExtensionQuery::new(AIDOKU))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

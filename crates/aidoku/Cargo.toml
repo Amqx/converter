@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+converter-core = { path = "../core" }
+
+[lints]
+workspace = true

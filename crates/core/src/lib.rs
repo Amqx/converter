@@ -1,3 +1,17 @@
+// Tests run against hand-built fixtures, so an `unwrap`, an index or a `panic!`
+// there is an assertion about the fixture rather than a fallible path - the
+// non-test build still holds the library itself to the workspace's bans.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::float_cmp
+    )
+)]
+
 #[macro_use]
 mod macros;
 

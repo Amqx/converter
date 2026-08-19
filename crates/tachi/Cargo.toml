@@ -4,4 +4,22 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+prost = "0.14.4"
 thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+converter-core = { path = "../core" }
+# `.tachibk` is a gzipped protobuf; `jiff` is the timestamp type the core IR already speaks.
+flate2 = "1.1.9"
+jiff = { workspace = true }
+
+[dev-dependencies]
+# Only the schema generator in `src/protos/schema.rs` needs these; the bindings it
+# produces are checked in, so a normal build never reaches for them.
+prost-build = "0.14.4"
+regex = "1.13.1"
+tokio = { version = "1.49.0", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

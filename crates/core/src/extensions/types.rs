@@ -25,6 +25,24 @@ pub struct ExtensionRepositoryInfo {
     pub signing_key: Option<String>,
 }
 
+impl ExtensionRepositoryInfo {
+    pub const fn new(
+        reader: ReaderID,
+        name: Option<String>,
+        short_name: Option<String>,
+        website: Option<String>,
+        signing_key: Option<String>,
+    ) -> Self {
+        Self {
+            reader,
+            name,
+            short_name,
+            website,
+            signing_key,
+        }
+    }
+}
+
 /// A partially specified extension to search for. Everything but the app is
 /// optional; an empty query matches whatever the repository has.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -37,17 +55,23 @@ pub struct ExtensionQuery {
 }
 
 impl ExtensionQuery {
-    pub fn new(reader: ReaderID) -> Self {
-        Self { reader, name: None, external_id: None, lang: None, url: None }
+    pub const fn new(reader: ReaderID) -> Self {
+        Self {
+            reader,
+            name: None,
+            external_id: None,
+            lang: None,
+            url: None,
+        }
     }
-    
+
     pub fn equivalent_of(extension: &Extension, reader: ReaderID) -> Self {
         Self {
             reader,
             name: Some(extension.name.clone()),
             external_id: Some(extension.external_id.clone()),
             lang: Some(extension.lang.clone()),
-            url: Some(extension.url.clone())
+            url: Some(extension.url.clone()),
         }
     }
 }
@@ -62,7 +86,9 @@ pub struct ExtensionMatch {
 /// Boxed by hand because `async fn` in a trait isn't dyn-safe.
 pub type RefreshFuture<'a> = Pin<Box<dyn Future<Output = ExtResult<()>> + Send + 'a>>;
 
-pub trait ExtensionRepository {
+/// `Send` so that a matcher-wide `refresh()` is itself `Send`, and can be
+/// spawned on a multi-threaded runtime instead of pinning the caller's thread.
+pub trait ExtensionRepository: Send {
     fn info(&self) -> &ExtensionRepositoryInfo;
 
     /// Searches the index built by the last [`refresh`](Self::refresh); never

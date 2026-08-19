@@ -12,14 +12,14 @@ pub enum UnresolvedReason {
     Declined { candidates: usize },
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct UnresolvedExtension {
     pub extension: Arc<Extension>,
     pub reason: UnresolvedReason,
 }
 
 /// A backup's extension table, resolved against a target app.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExtensionMapping {
     target: ReaderID,
     resolved: HashMap<Arc<Extension>, Arc<Extension>>,
@@ -28,10 +28,14 @@ pub struct ExtensionMapping {
 
 impl ExtensionMapping {
     pub fn new(target: ReaderID) -> Self {
-        Self { target, resolved: HashMap::new(), unresolved: Vec::new() }
+        Self {
+            target,
+            resolved: HashMap::new(),
+            unresolved: Vec::new(),
+        }
     }
 
-    pub fn target(&self) -> ReaderID {
+    pub const fn target(&self) -> ReaderID {
         self.target
     }
 
@@ -40,7 +44,8 @@ impl ExtensionMapping {
     }
 
     pub fn mark_unresolved(&mut self, extension: Arc<Extension>, reason: UnresolvedReason) {
-        self.unresolved.push(UnresolvedExtension { extension, reason });
+        self.unresolved
+            .push(UnresolvedExtension { extension, reason });
     }
 
     pub fn get(&self, source: &Arc<Extension>) -> Option<&Arc<Extension>> {
@@ -50,8 +55,7 @@ impl ExtensionMapping {
     /// Whether resolution looked at `source` at all, mapped or not. An entry
     /// whose extension isn't in here was never in `Backup::extensions` either.
     pub fn contains(&self, source: &Arc<Extension>) -> bool {
-        self.resolved.contains_key(source)
-            || self.unresolved.iter().any(|u| &u.extension == source)
+        self.resolved.contains_key(source) || self.unresolved.iter().any(|u| &u.extension == source)
     }
 
     pub fn resolved(&self) -> impl Iterator<Item = (&Arc<Extension>, &Arc<Extension>)> {
@@ -62,7 +66,7 @@ impl ExtensionMapping {
         &self.unresolved
     }
 
-    pub fn is_fully_resolved(&self) -> bool {
+    pub const fn is_fully_resolved(&self) -> bool {
         self.unresolved.is_empty()
     }
 }

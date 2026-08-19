@@ -1,13 +1,15 @@
 pub mod mapping;
 pub mod policy;
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
 use crate::ReaderID;
 use crate::extensions::ExtensionError;
-use crate::format::BackupFormat;
 use crate::extensions::matcher::{ExtensionMatcher, RefreshReport};
 use crate::extensions::types::ExtensionQuery;
+use crate::format::BackupFormat;
 use crate::io::reader::{BackupReader, ReadReport};
 use crate::io::writer::{BackupWriter, WriteReport};
 use crate::io::{ReadError, WriteError};
@@ -30,7 +32,11 @@ pub enum OrchestratorError {
         "a repository serving {expected} returned extension '{extension}', \
          which belongs to {found}"
     )]
-    ForeignExtension { extension: String, expected: ReaderID, found: ReaderID },
+    ForeignExtension {
+        extension: String,
+        expected: ReaderID,
+        found: ReaderID,
+    },
     #[error(
         "entry '{entry}' references extension '{extension}', which is not in the \
          backup's extension table; the reader must share one `Arc<Extension>` \
@@ -60,7 +66,7 @@ pub struct PruneReport {
 }
 
 impl PruneReport {
-    pub fn dropped(&self) -> usize {
+    pub const fn dropped(&self) -> usize {
         self.unresolved.len() + self.unknown.len()
     }
 }
@@ -85,7 +91,12 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(matcher: ExtensionMatcher, policy: Box<dyn ResolutionPolicy>) -> Self {
-        Self { readers: Vec::new(), writers: Vec::new(), matcher, policy }
+        Self {
+            readers: Vec::new(),
+            writers: Vec::new(),
+            matcher,
+            policy,
+        }
     }
 
     pub fn register_reader(&mut self, reader: Box<dyn BackupReader>) {
@@ -128,7 +139,7 @@ impl Orchestrator {
         self.matcher.refresh().await
     }
 
-    pub fn matcher(&self) -> &ExtensionMatcher {
+    pub const fn matcher(&self) -> &ExtensionMatcher {
         &self.matcher
     }
 
@@ -163,15 +174,17 @@ impl Orchestrator {
                             found: target.reader,
                         });
                     }
-                    mapping.insert(extension.clone(), target)
+                    mapping.insert(Arc::clone(extension), target);
                 }
                 Resolution::Skip => {
                     let reason = if candidates.is_empty() {
                         UnresolvedReason::NoCandidates
                     } else {
-                        UnresolvedReason::Declined { candidates: candidates.len() }
+                        UnresolvedReason::Declined {
+                            candidates: candidates.len(),
+                        }
                     };
-                    mapping.mark_unresolved(extension.clone(), reason);
+                    mapping.mark_unresolved(Arc::clone(extension), reason);
                 }
                 Resolution::Abort => {
                     return Err(OrchestratorError::ResolutionAborted {
@@ -252,7 +265,13 @@ impl Orchestrator {
 
         let (bytes, write) = self.write(&backup, &mapping, to)?;
 
-        Ok(Conversion { bytes, mapping, read, prune, write })
+        Ok(Conversion {
+            bytes,
+            mapping,
+            read,
+            prune,
+            write,
+        })
     }
 }
 
@@ -313,7 +332,7 @@ mod tests {
         }
     }
 
-    /// Exact on external_id, `name_score` on the name alone.
+    /// Exact on `external_id`, `name_score` on the name alone.
     struct StubRepo {
         info: ExtensionRepositoryInfo,
         index: Vec<Arc<Extension>>,
@@ -339,7 +358,10 @@ mod tests {
                     } else {
                         return None;
                     };
-                    Some(ExtensionMatch { extension: candidate.clone(), score })
+                    Some(ExtensionMatch {
+                        extension: Arc::clone(candidate),
+                        score,
+                    })
                 })
                 .collect())
         }
@@ -395,10 +417,10 @@ mod tests {
         let backup = Backup {
             reader: TACHI,
             version: Some("2".into()),
-            extensions: vec![matched.clone(), orphan.clone()],
+            extensions: vec![Arc::clone(&matched), Arc::clone(&orphan)],
             entries: vec![
-                manga("Berserk", matched.clone()),
-                manga("Vagabond", orphan.clone()),
+                manga("Berserk", Arc::clone(&matched)),
+                manga("Vagabond", Arc::clone(&orphan)),
             ],
             categories: Vec::new(),
         };
@@ -437,7 +459,10 @@ mod tests {
 
         let conversion = orchestrator.convert(b"", TACHI, AIDOKU).unwrap();
 
-        assert_eq!(String::from_utf8(conversion.bytes).unwrap(), "Berserk:mangadex");
+        assert_eq!(
+            String::from_utf8(conversion.bytes).unwrap(),
+            "Berserk:mangadex"
+        );
         assert_eq!(conversion.prune.dropped(), 1);
         assert_eq!(conversion.prune.unresolved[0].title, "Vagabond");
         assert!(conversion.prune.unknown.is_empty());
@@ -456,7 +481,10 @@ mod tests {
 
         assert_eq!(mapping.unresolved().len(), 1);
         assert_eq!(mapping.unresolved()[0].extension, orphan);
-        assert_eq!(mapping.unresolved()[0].reason, UnresolvedReason::NoCandidates);
+        assert_eq!(
+            mapping.unresolved()[0].reason,
+            UnresolvedReason::NoCandidates
+        );
     }
 
     #[test]
@@ -543,7 +571,10 @@ mod tests {
             Box::new(AutoBest::default()),
         );
         let (mut backup, matched, _) = fixture();
-        let rebuilt = Arc::new(Extension { url: String::new(), ..(*matched).clone() });
+        let rebuilt = Arc::new(Extension {
+            url: String::new(),
+            ..(*matched).clone()
+        });
         backup.entries.push(manga("Monster", rebuilt));
 
         let mapping = orchestrator.resolve(&backup, AIDOKU).unwrap();
@@ -557,14 +588,17 @@ mod tests {
 
     #[test]
     fn convert_refuses_to_silently_drop_unknown_extensions() {
-        let matched = extension(TACHI, "MangaDex", "mangadex");
-        let rebuilt = Arc::new(Extension { url: String::new(), ..(*matched).clone() });
+        let registered = extension(TACHI, "MangaDex", "mangadex");
+        let rebuilt = Arc::new(Extension {
+            url: String::new(),
+            ..(*registered).clone()
+        });
         // Every entry points outside the table, so a silent prune hands back an
         // empty backup with a mapping claiming everything went fine.
         let backup = Backup {
             reader: TACHI,
             version: None,
-            extensions: vec![matched],
+            extensions: vec![registered],
             entries: vec![manga("Berserk", rebuilt)],
             categories: Vec::new(),
         };
@@ -575,8 +609,7 @@ mod tests {
             index: vec![extension(AIDOKU, "MangaDex", "mangadex")],
             name_score: 0.9,
         }));
-        let mut orchestrator =
-            Orchestrator::new(matcher, Box::new(AutoBest::default()));
+        let mut orchestrator = Orchestrator::new(matcher, Box::new(AutoBest::default()));
         orchestrator.register_reader(Box::new(StubReader { backup }));
         orchestrator.register_writer(Box::new(StubWriter));
 
@@ -597,7 +630,11 @@ mod tests {
 
         assert!(matches!(
             orchestrator.resolve(&backup, AIDOKU),
-            Err(OrchestratorError::ForeignExtension { expected: AIDOKU, found: TACHI, .. })
+            Err(OrchestratorError::ForeignExtension {
+                expected: AIDOKU,
+                found: TACHI,
+                ..
+            })
         ));
     }
 }

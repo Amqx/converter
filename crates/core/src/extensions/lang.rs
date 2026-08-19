@@ -26,7 +26,7 @@ impl Language {
             .iter()
             .any(|any| trimmed.eq_ignore_ascii_case(any))
         {
-            return Ok(Language::All);
+            return Ok(Self::All);
         }
 
         let unknown = || ExtensionError::UnknownLanguageCode(code.to_string());
@@ -47,15 +47,23 @@ impl Language {
             }
         }
 
-        Ok(Language::Tagged { iso, script, region })
+        Ok(Self::Tagged {
+            iso,
+            script,
+            region,
+        })
     }
 
     /// Back to a code we can write into a backup. Prefers the two-letter form,
     /// falling back to 639-3 for languages that don't have one.
     pub fn to_code(&self) -> String {
         match self {
-            Language::All => "all".to_string(),
-            Language::Tagged { iso, script, region } => {
+            Self::All => "all".to_string(),
+            Self::Tagged {
+                iso,
+                script,
+                region,
+            } => {
                 let mut code = iso.to_639_1().unwrap_or_else(|| iso.to_639_3()).to_string();
                 if let Some(script) = script {
                     code.push('-');
@@ -82,22 +90,25 @@ fn is_region(subtag: &str) -> bool {
 
 fn titlecase(subtag: &str) -> String {
     let mut chars = subtag.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase(),
-        None => String::new(),
-    }
+    chars.next().map_or_else(String::new, |first| {
+        first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+    })
 }
 
 impl std::fmt::Display for Language {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Language::All => write!(f, "Multilingual (all)"),
-            Language::Tagged { iso, script, region } => {
+            Self::All => write!(f, "Multilingual (all)"),
+            Self::Tagged {
+                iso,
+                script,
+                region,
+            } => {
                 write!(f, "{}", iso.to_name())?;
                 let qualifiers: Vec<&str> = script
                     .iter()
                     .chain(region.iter())
-                    .map(|s| s.as_str())
+                    .map(String::as_str)
                     .collect();
                 if !qualifiers.is_empty() {
                     write!(f, " ({})", qualifiers.join("-"))?;

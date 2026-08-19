@@ -58,9 +58,6 @@ macro_rules! declare_format {
             > {
                 ::std::vec![$($(
                     ::std::boxed::Box::new($repo)
-                        as ::std::boxed::Box<
-                            dyn $crate::extensions::types::ExtensionRepository,
-                        >
                 ),*)?]
             }
         }
@@ -131,10 +128,7 @@ macro_rules! __format_writer {
         ::std::option::Option::None
     };
     ($writer:expr) => {
-        ::std::option::Option::Some(
-            ::std::boxed::Box::new($writer)
-                as ::std::boxed::Box<dyn $crate::io::writer::BackupWriter>,
-        )
+        ::std::option::Option::Some(::std::boxed::Box::new($writer))
     };
 }
 
@@ -275,7 +269,11 @@ mod tests {
 
         let backup = orchestrator.read(b"", Exportable::ID).unwrap().0;
         let mapping = orchestrator.resolve(&backup, Exportable::ID).unwrap();
-        assert!(orchestrator.write(&backup, &mapping, Exportable::ID).is_ok());
+        assert!(
+            orchestrator
+                .write(&backup, &mapping, Exportable::ID)
+                .is_ok()
+        );
     }
 
     /// `declare_format!` takes any expression for its reader, so nothing stops
