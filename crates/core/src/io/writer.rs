@@ -1,4 +1,4 @@
-use super::{FailedExtension, SkippedExtension, WriteError};
+use super::{DroppedEntries, FailedExtension, SkippedExtension, WriteError};
 use crate::ReaderID;
 use crate::ir::types::Backup;
 use crate::orchestrator::mapping::ExtensionMapping;
@@ -7,6 +7,7 @@ use crate::orchestrator::mapping::ExtensionMapping;
 pub struct WriteReport {
     pub failed: Vec<FailedExtension>,
     pub skipped: Vec<SkippedExtension>,
+    pub dropped: Vec<DroppedEntries>,
 }
 
 /// `Send` for the same reason as

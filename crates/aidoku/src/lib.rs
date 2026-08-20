@@ -13,6 +13,7 @@ use crate::reader::AidokuReader;
 use crate::sources::Amqx;
 use crate::writer::AidokuWriter;
 
+pub mod quirks;
 mod reader;
 mod sources;
 mod writer;

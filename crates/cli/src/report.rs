@@ -199,6 +199,15 @@ pub fn write(report: &WriteReport) {
             skipped.reason
         );
     }
+    for dropped in &report.dropped {
+        println!(
+            "warning: dropped {} rows from {}: {} (e.g. {})",
+            dropped.count,
+            extension(&dropped.extension),
+            dropped.reason,
+            dropped.examples.join(", ")
+        );
+    }
 }
 
 /// Rounded to one decimal, in integer arithmetic - a cast to `f64` to print a

@@ -3,13 +3,14 @@ use std::collections::{HashMap, HashSet};
 use converter_core::extensions::lang::Language;
 use converter_core::extensions::types::Extension;
 use converter_core::io::writer::{BackupWriter, WriteReport};
-use converter_core::io::{FailedExtension, SkippedExtension, WriteError};
+use converter_core::io::{DroppedEntries, FailedExtension, SkippedExtension, WriteError};
 use converter_core::ir::types::{Backup, Category, CategoryID, Chapter, Manga, MangaStatus};
 use converter_core::orchestrator::mapping::ExtensionMapping;
 use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::Aidoku;
+use crate::quirks::{Quirks, Rewritten, SourceQuirk, SourceRules};
 
 /// `MangaObject.nsfw` is a rating rather than a flag; 2 is the one the reader
 /// reads back as nsfw.
@@ -22,11 +23,23 @@ const DEFAULT_VIEWER: i64 = 0;
 /// scopes every id to the source that produced it, and restores by the pair.
 type MangaKey = (String, String);
 
-pub struct AidokuWriter {}
+/// How many of the ids behind a drop the report quotes. Enough to recognise the
+/// shape a missing pattern would have to match, short enough to print.
+const EXAMPLES: usize = 3;
+
+pub struct AidokuWriter {
+    quirks: &'static [SourceQuirk],
+}
 
 impl AidokuWriter {
     pub const fn new() -> Self {
-        Self {}
+        Self::with_quirks(crate::quirks::BUILTIN)
+    }
+
+    /// The same writer against another table of [source quirks](crate::quirks),
+    /// for a caller that has its own.
+    pub const fn with_quirks(quirks: &'static [SourceQuirk]) -> Self {
+        Self { quirks }
     }
 }
 
@@ -44,7 +57,7 @@ impl BackupWriter for AidokuWriter {
         backup: &Backup,
         mapping: &ExtensionMapping,
     ) -> Result<(Vec<u8>, WriteReport), WriteError> {
-        let (raw, report) = assemble(backup, mapping, Timestamp::now());
+        let (raw, report) = assemble(backup, mapping, self.quirks, Timestamp::now());
 
         let mut bytes = Vec::new();
         // Aidoku writes a binary property list and reads that before it falls
@@ -61,10 +74,14 @@ impl BackupWriter for AidokuWriter {
 fn assemble(
     backup: &Backup,
     mapping: &ExtensionMapping,
+    quirks: &'static [SourceQuirk],
     now: Timestamp,
 ) -> (RawBackup, WriteReport) {
     let mut report = WriteReport::default();
-    let (targets, sources) = targets(backup, mapping, &mut report);
+    // Only the rules written for the app this backup came from: the ids in an
+    // Aidoku backup are already Aidoku's.
+    let quirks = Quirks::compile(quirks, backup.reader);
+    let (targets, sources) = targets(backup, mapping, &quirks, &mut report);
 
     let (categories, titles) = categories(&backup.categories);
 
@@ -91,7 +108,26 @@ fn assemble(
         // Already reported by `targets`; the entries behind it just go.
         let Some(target) = target else { continue };
 
-        let key = (target.external_id.clone(), entry.id.clone());
+        let rules = quirks.get(&target.external_id);
+        let id = match rewritten(rules, SourceRules::manga_id, &entry.id) {
+            Rewritten::Unchanged => entry.id.clone(),
+            Rewritten::Into(id) => id,
+            // Written unchanged this is a library row keyed by an id the
+            // source cannot open, which is the thing the rule is there to
+            // prevent - so the entry goes, and the report says which ids the
+            // rule would have to grow a pattern for.
+            Rewritten::NoMatch => {
+                contents.drops.record(
+                    entry.extension.as_ref(),
+                    &target.external_id,
+                    "entry ids",
+                    &entry.id,
+                );
+                continue;
+            }
+        };
+
+        let key = (target.external_id.clone(), id);
         // Two of the source app's extensions can map onto one Aidoku source,
         // and Aidoku restores by `(sourceId, mangaId)`: writing both copies
         // would put the same series in the library twice.
@@ -99,7 +135,7 @@ fn assemble(
             continue;
         }
 
-        contents.push_entry(entry, target, &key, &titles, now);
+        contents.push_entry(entry, target, &key, &titles, now, rules);
     }
 
     let Contents {
@@ -107,7 +143,9 @@ fn assemble(
         history,
         manga,
         chapters,
+        drops,
     } = contents;
+    report.dropped = drops.rows();
 
     let backup = RawBackup {
         library,
@@ -135,6 +173,7 @@ fn assemble(
 fn targets<'a>(
     backup: &'a Backup,
     mapping: &'a ExtensionMapping,
+    quirks: &Quirks,
     report: &mut WriteReport,
 ) -> (HashMap<&'a Extension, Option<&'a Extension>>, Vec<String>) {
     let mut targets = HashMap::with_capacity(backup.extensions.len());
@@ -163,7 +202,23 @@ fn targets<'a>(
                 });
                 None
             }
-            Some(target) => Some(target),
+            // A rule that will not parse is the one case where writing the
+            // ids unchanged is not the safe answer: it is this source's own
+            // ids the rule was about.
+            Some(target) => match quirks.broken(&target.external_id) {
+                Some(reason) => {
+                    report.failed.push(FailedExtension {
+                        reason: format!(
+                            "matched Aidoku source '{}', whose rewrite rule will not parse: \
+                             {reason}",
+                            target.external_id
+                        ),
+                        extension: extension.as_ref().clone(),
+                    });
+                    None
+                }
+                None => Some(target),
+            },
         };
 
         // Several of the backup's extensions can share one Aidoku source.
@@ -217,6 +272,7 @@ struct Contents {
     history: Vec<RawHistory>,
     manga: Vec<RawManga>,
     chapters: Vec<RawChapter>,
+    drops: Drops,
 }
 
 impl Contents {
@@ -227,6 +283,7 @@ impl Contents {
         key: &MangaKey,
         titles: &HashMap<&CategoryID, &str>,
         now: Timestamp,
+        rules: Option<&SourceRules>,
     ) {
         let (source_id, manga_id) = key;
 
@@ -245,20 +302,23 @@ impl Contents {
         });
 
         let lang = chapter_lang(&entry.extension.lang, &target.lang);
-        let mut ids: HashSet<&str> = HashSet::with_capacity(entry.chapters.len());
+        let mut ids: HashSet<String> = HashSet::with_capacity(entry.chapters.len());
         let mut order = 0;
 
         for chapter in &entry.chapters {
+            let Some(id) = self.chapter_id(entry, source_id, rules, &chapter.id) else {
+                continue;
+            };
             // The same chapter twice would be two rows in the reader, and the
             // second would take the first's place in the source order.
-            if !ids.insert(chapter.id.as_str()) {
+            if !ids.insert(id.clone()) {
                 continue;
             }
 
             self.chapters.push(RawChapter {
                 source_id: source_id.clone(),
                 manga_id: manga_id.clone(),
-                id: chapter.id.clone(),
+                id: id.clone(),
                 title: non_empty(&chapter.title),
                 scanlator: chapter.scanlator.clone(),
                 lang: lang.clone(),
@@ -268,7 +328,7 @@ impl Contents {
             });
             order += 1;
 
-            if let Some(row) = history_row(chapter, key) {
+            if let Some(row) = history_row(chapter, key, id) {
                 self.history.push(row);
             }
         }
@@ -279,7 +339,10 @@ impl Contents {
             let Some(id) = row.chapter_id.as_deref().or(row.url.as_deref()) else {
                 continue;
             };
-            if !ids.insert(id) {
+            let Some(id) = self.chapter_id(entry, source_id, rules, id) else {
+                continue;
+            };
+            if !ids.insert(id.clone()) {
                 continue;
             }
 
@@ -287,7 +350,7 @@ impl Contents {
                 date_read: date_or_epoch(row.last_read),
                 source_id: source_id.clone(),
                 manga_id: manga_id.clone(),
-                chapter_id: id.to_string(),
+                chapter_id: id,
                 progress: 0,
                 completed: true,
             });
@@ -296,6 +359,79 @@ impl Contents {
         if entry.favorite {
             self.library.push(library_row(entry, key, titles, now));
         }
+    }
+
+    /// The id to write for one chapter, or `None` for one the source's rule
+    /// cannot translate - a row keyed by an id the Aidoku source cannot open
+    /// is the thing the rule is there to prevent, and the rest of the entry is
+    /// still worth writing.
+    fn chapter_id(
+        &mut self,
+        entry: &Manga,
+        source: &str,
+        rules: Option<&SourceRules>,
+        id: &str,
+    ) -> Option<String> {
+        match rewritten(rules, SourceRules::chapter_id, id) {
+            Rewritten::Unchanged => Some(id.to_string()),
+            Rewritten::Into(id) => Some(id),
+            Rewritten::NoMatch => {
+                self.drops
+                    .record(entry.extension.as_ref(), source, "chapter ids", id);
+                None
+            }
+        }
+    }
+}
+
+/// A rule the source may not have, applied to one id.
+fn rewritten(
+    rules: Option<&SourceRules>,
+    field: fn(&SourceRules, &str) -> Rewritten,
+    id: &str,
+) -> Rewritten {
+    rules.map_or(Rewritten::Unchanged, |rules| field(rules, id))
+}
+
+/// Everything the rules could not translate, one row per source extension and
+/// field rather than per entry: a backup can hold thousands of chapters from
+/// one source and they are all the same missing pattern.
+#[derive(Default)]
+struct Drops {
+    rows: Vec<(&'static str, DroppedEntries)>,
+}
+
+impl Drops {
+    /// `subject` names what the count is of, and lands in the reported reason.
+    fn record(&mut self, extension: &Extension, source: &str, subject: &'static str, id: &str) {
+        let existing = self
+            .rows
+            .iter_mut()
+            .find(|(kept, row)| *kept == subject && row.extension == *extension);
+
+        if let Some((_, row)) = existing {
+            row.count += 1;
+            if row.examples.len() < EXAMPLES {
+                row.examples.push(id.to_string());
+            }
+            return;
+        }
+
+        self.rows.push((
+            subject,
+            DroppedEntries {
+                reason: format!("no rewrite rule for Aidoku source '{source}' matched these"),
+                extension: extension.clone(),
+                count: 1,
+                examples: vec![id.to_string()],
+            },
+        ));
+    }
+
+    /// In the order the drops were first hit, so a report reads the way the
+    /// backup does.
+    fn rows(self) -> Vec<DroppedEntries> {
+        self.rows.into_iter().map(|(_, row)| row).collect()
     }
 }
 
@@ -342,7 +478,7 @@ fn last_read(entry: &Manga) -> Option<Timestamp> {
 /// Aidoku keeps no read flag on a chapter: the reader marks one read by the
 /// history row that points at it, so a chapter with anything to say about its
 /// progress needs a row of its own.
-fn history_row(chapter: &Chapter, key: &MangaKey) -> Option<RawHistory> {
+fn history_row(chapter: &Chapter, key: &MangaKey, chapter_id: String) -> Option<RawHistory> {
     if !chapter.read && chapter.last_read.is_none() && chapter.last_page_read <= 0 {
         return None;
     }
@@ -356,7 +492,7 @@ fn history_row(chapter: &Chapter, key: &MangaKey) -> Option<RawHistory> {
         date_read: date_or_epoch(chapter.last_read.unwrap_or(Timestamp::UNIX_EPOCH)),
         source_id: source_id.clone(),
         manga_id: manga_id.clone(),
-        chapter_id: chapter.id.clone(),
+        chapter_id,
         progress: narrow_i32(chapter.last_page_read),
         completed: chapter.read,
     })
@@ -525,12 +661,18 @@ struct RawCategory {
 mod tests {
     use std::sync::Arc;
 
+    use converter_core::ReaderID;
     use converter_core::extensions::types::ExtensionRepositoryInfo;
     use converter_core::io::reader::BackupReader;
     use converter_core::ir::types::History;
 
     use super::*;
+    use crate::quirks::Rewrite;
     use crate::reader::AidokuReader;
+
+    /// The one other app the binary reads, and the app every rule in
+    /// [`crate::quirks::BUILTIN`] is written against.
+    const TACHI: ReaderID = ReaderID("tachiyomi");
 
     /// A source as the reader hands it back: a backup names its sources by id
     /// and records nothing else about them, so anything else here would fail a
@@ -945,7 +1087,7 @@ mod tests {
         entry.date_added = None;
         let backup = backup(vec![Arc::clone(&source)], vec![entry]);
 
-        let (raw, _) = assemble(&backup, &identity(&backup), timestamp(NOW));
+        let (raw, _) = assemble(&backup, &identity(&backup), &[], timestamp(NOW));
 
         assert_eq!(raw.library[0].date_added, date_or_epoch(timestamp(NOW)));
         // Not optional in the app's decoder, so they have to say something.
@@ -962,7 +1104,7 @@ mod tests {
         entry.date_added = Timestamp::from_second(-62_167_219_201).ok();
         let backup = backup(vec![Arc::clone(&source)], vec![entry]);
 
-        let (raw, _) = assemble(&backup, &identity(&backup), timestamp(NOW));
+        let (raw, _) = assemble(&backup, &identity(&backup), &[], timestamp(NOW));
 
         // The pre-epoch date fell back to the epoch rather than panicking.
         assert_eq!(raw.library[0].date_added, date_or_epoch(timestamp(0)),);
@@ -1015,5 +1157,179 @@ mod tests {
 
         // Both sides say nothing specific → empty string.
         assert_eq!(field(row, "lang").as_string(), Some(""));
+    }
+
+    /// A source extension as the Tachiyomi reader hands one back: an id of its
+    /// own, and no language on it at all - `backupSources` carries none.
+    fn tachi_extension(id: &str) -> Arc<Extension> {
+        Arc::new(Extension {
+            reader: TACHI,
+            name: "MangaDex".to_string(),
+            external_id: id.to_string(),
+            url: String::new(),
+            lang: Language::Unknown,
+            repo: ExtensionRepositoryInfo::new(TACHI, None, None, None, None),
+        })
+    }
+
+    fn imported(extensions: Vec<Arc<Extension>>, entries: Vec<Manga>) -> Backup {
+        Backup {
+            reader: TACHI,
+            version: Some("1.5.4".to_string()),
+            extensions,
+            entries,
+            categories: Vec::new(),
+        }
+    }
+
+    fn onto(source: &Arc<Extension>, target: &Arc<Extension>) -> ExtensionMapping {
+        let mut mapping = ExtensionMapping::new(Aidoku::ID);
+        mapping
+            .insert(Arc::clone(source), Arc::clone(target))
+            .unwrap();
+        mapping
+    }
+
+    const MANGA: &str = "b41b1e9d-b60c-4b17-bfc2-93a9e0b2f0b8";
+    const CHAPTER: &str = "0f2d5b1a-1f0a-4f9d-9a3e-2c7d5f6a8b90";
+
+    /// The whole point: `MangaDex` is the same site in both apps and the ids are
+    /// not, so every row that carries one has to be translated together.
+    #[test]
+    fn a_quirk_rewrites_the_ids_the_target_source_spells_differently() {
+        let tachi = tachi_extension("2499283573021220255");
+        let aidoku = extension("multi.mangadex");
+
+        let mut read = chapter(&format!("/chapter/{CHAPTER}"));
+        read.read = true;
+        read.last_read = Some(timestamp(1_700_000_100));
+
+        let mut series = entry(&format!("/manga/{MANGA}"), &tachi);
+        series.chapters = vec![read];
+
+        let backup = imported(vec![Arc::clone(&tachi)], vec![series]);
+        let (value, report) = written(&backup, &onto(&tachi, &aidoku));
+
+        assert_eq!(report.dropped, Vec::new());
+        assert_eq!(
+            field(&array(&value, "manga")[0], "id").as_string(),
+            Some(MANGA)
+        );
+
+        let chapter = &array(&value, "chapters")[0];
+        assert_eq!(field(chapter, "id").as_string(), Some(CHAPTER));
+        // The chapter is keyed to the entry, so a half-translated pair would
+        // restore into a series that has no chapters.
+        assert_eq!(field(chapter, "mangaId").as_string(), Some(MANGA));
+
+        let history = &array(&value, "history")[0];
+        assert_eq!(field(history, "chapterId").as_string(), Some(CHAPTER));
+        assert_eq!(field(history, "mangaId").as_string(), Some(MANGA));
+
+        let library = &array(&value, "library")[0];
+        assert_eq!(field(library, "mangaId").as_string(), Some(MANGA));
+    }
+
+    /// An id the rule cannot translate is one nothing knows the target app's
+    /// spelling of, and writing it unchanged is the dead row the rule exists to
+    /// prevent. The rest of the entry is still worth writing.
+    #[test]
+    fn a_chapter_id_no_pattern_matches_is_dropped_and_counted() {
+        let tachi = tachi_extension("2499283573021220255");
+        let aidoku = extension("multi.mangadex");
+
+        let mut series = entry(&format!("/manga/{MANGA}"), &tachi);
+        series.chapters = vec![
+            chapter(&format!("/chapter/{CHAPTER}")),
+            chapter("/legacy/1"),
+            chapter("/legacy/2"),
+            chapter("/legacy/3"),
+            chapter("/legacy/4"),
+        ];
+
+        let backup = imported(vec![Arc::clone(&tachi)], vec![series]);
+        let (value, report) = written(&backup, &onto(&tachi, &aidoku));
+
+        assert_eq!(array(&value, "chapters").len(), 1);
+        assert_eq!(array(&value, "manga").len(), 1);
+
+        let dropped = &report.dropped[0];
+        assert_eq!(dropped.extension, *tachi);
+        assert_eq!(dropped.count, 4);
+        // Counted in full, quoted in part.
+        assert_eq!(dropped.examples, ["/legacy/1", "/legacy/2", "/legacy/3"]);
+    }
+
+    #[test]
+    fn an_entry_whose_own_id_will_not_translate_takes_its_chapters_with_it() {
+        let tachi = tachi_extension("2499283573021220255");
+        let aidoku = extension("multi.mangadex");
+
+        let mut series = entry("/title/legacy", &tachi);
+        series.chapters = vec![chapter(&format!("/chapter/{CHAPTER}"))];
+
+        let backup = imported(vec![Arc::clone(&tachi)], vec![series]);
+        let (value, report) = written(&backup, &onto(&tachi, &aidoku));
+
+        assert!(dictionary(&value).get("manga").is_none());
+        assert!(dictionary(&value).get("chapters").is_none());
+        assert!(dictionary(&value).get("library").is_none());
+        // The source itself still resolved, so the backup still subscribes to
+        // it; it is the entries under it that could not be written.
+        assert_eq!(array(&value, "sources").len(), 1);
+
+        assert_eq!(report.dropped.len(), 1);
+        assert_eq!(report.dropped[0].count, 1);
+        assert_eq!(report.dropped[0].examples, ["/title/legacy"]);
+    }
+
+    /// An Aidoku backup's ids are already Aidoku's. A rule written against
+    /// Tachiyomi's spelling would call every one of them unrecognised and drop
+    /// the library on the floor.
+    #[test]
+    fn an_aidoku_backup_keeps_the_ids_it_already_has() {
+        let mangadex = extension("multi.mangadex");
+        // Shaped like Tachiyomi's, so only the app the backup came from can be
+        // what leaves it alone.
+        let series = entry("/manga/1", &mangadex);
+
+        let backup = backup(vec![Arc::clone(&mangadex)], vec![series]);
+        let (value, report) = written(&backup, &identity(&backup));
+
+        assert_eq!(report.dropped, Vec::new());
+        assert_eq!(
+            field(&array(&value, "manga")[0], "id").as_string(),
+            Some("/manga/1")
+        );
+    }
+
+    /// The one case where leaving the ids alone is not the safe answer: it is
+    /// this source's own ids the rule was about, so the source is refused.
+    #[test]
+    fn a_source_whose_rule_will_not_parse_is_refused_rather_than_written_wrong() {
+        const TABLE: &[SourceQuirk] = &[SourceQuirk {
+            from: TACHI,
+            source: "multi.mangadex",
+            // Two holes in a row: nothing says where the first one ends.
+            manga: Some(Rewrite {
+                from: &["{a}{b}"],
+                into: "{a}",
+            }),
+            chapter: None,
+        }];
+
+        let tachi = tachi_extension("2499283573021220255");
+        let aidoku = extension("multi.mangadex");
+        let backup = imported(
+            vec![Arc::clone(&tachi)],
+            vec![entry(&format!("/manga/{MANGA}"), &tachi)],
+        );
+
+        let (raw, report) = assemble(&backup, &onto(&tachi, &aidoku), TABLE, timestamp(NOW));
+
+        assert!(raw.manga.is_empty());
+        assert!(raw.sources.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].reason.contains("will not parse"));
     }
 }

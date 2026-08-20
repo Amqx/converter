@@ -16,6 +16,21 @@ pub struct FailedExtension {
     pub extension: Extension,
 }
 
+/// Rows a writer left out of an otherwise good backup.
+///
+/// The extension resolved and the entries behind it are the app's own; what the
+/// target app spells differently is the part the writer could not produce. One
+/// row per reason rather than per entry - a source whose ids a writer cannot
+/// translate has the same thing to say about every entry under it.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct DroppedEntries {
+    pub reason: String,
+    pub extension: Extension,
+    pub count: usize,
+    /// A few of the values responsible, for a report that has to stay short.
+    pub examples: Vec<String>,
+}
+
 #[derive(Error, Debug)]
 pub enum ReadError {
     /// The container would not open: wrong file type, truncated, or corrupt.
