@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
+use crate::extensions::ExtensionError;
 use crate::extensions::types::{
     ExtensionMatch, ExtensionQuery, ExtensionRepository, ExtensionRepositoryInfo,
 };
-use crate::extensions::{ExtResult, ExtensionError};
 
 #[derive(Debug)]
 pub struct FailedRepository {
@@ -57,21 +57,32 @@ impl ExtensionMatcher {
     }
 
     /// Candidates from every repo serving `query.reader`, best score first.
-    pub fn find_matches(&self, query: &ExtensionQuery) -> ExtResult<Vec<ExtensionMatch>> {
+    /// Search failures are left in the report rather than aborting: one repo
+    /// that cannot be queried drops its candidates but not the rest.
+    pub fn find_matches(
+        &self,
+        query: &ExtensionQuery,
+    ) -> (Vec<ExtensionMatch>, Vec<FailedRepository>) {
         let mut results = Vec::new();
+        let mut failed = Vec::new();
 
         for repo in &self.extension_repos {
             if repo.info().reader != query.reader {
                 continue;
             }
-            results.extend(repo.search(query)?);
+            match repo.search(query) {
+                Ok(matches) => results.extend(matches),
+                Err(error) => failed.push(FailedRepository {
+                    repo: repo.info().clone(),
+                    error,
+                }),
+            }
         }
 
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // `total_cmp` rather than `partial_cmp`: a repo that scores a candidate
+        // NaN would otherwise break the comparator's total order, which the
+        // sort detects and aborts on.
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         // Two repos indexing the same extension always describe it a little
         // differently (`repo` alone guarantees that), so dedup on its identity
@@ -83,7 +94,7 @@ impl ExtensionMatcher {
                 || seen.insert((m.extension.reader, m.extension.external_id.clone()))
         });
 
-        Ok(results)
+        (results, failed)
     }
 }
 
@@ -96,6 +107,7 @@ mod tests {
 
     use super::*;
     use crate::ReaderID;
+    use crate::extensions::ExtResult;
     use crate::extensions::lang::Language;
     use crate::extensions::types::{Extension, RefreshFuture};
 
@@ -140,6 +152,7 @@ mod tests {
         score: f32,
         refresh_fails: bool,
         refreshed: bool,
+        search_fails: bool,
     }
 
     impl StubRepo {
@@ -150,6 +163,7 @@ mod tests {
                 score: 1.0,
                 refresh_fails: false,
                 refreshed: false,
+                search_fails: false,
             }
         }
 
@@ -164,6 +178,11 @@ mod tests {
             self.score = score;
             self
         }
+
+        fn search_errors(mut self) -> Self {
+            self.search_fails = true;
+            self
+        }
     }
 
     impl ExtensionRepository for StubRepo {
@@ -172,6 +191,12 @@ mod tests {
         }
 
         fn search(&self, _query: &ExtensionQuery) -> ExtResult<Vec<ExtensionMatch>> {
+            if self.search_fails {
+                return Err(ExtensionError::MalformedIndex {
+                    repo: "stub".into(),
+                    message: "bang".into(),
+                });
+            }
             Ok(self
                 .index
                 .iter()
@@ -207,8 +232,9 @@ mod tests {
             vec![extension(&community, "MangaDex", "mangadex")],
         )));
 
-        let found = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
+        let (found, failed) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
 
+        assert!(failed.is_empty());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].extension.repo, official);
     }
@@ -227,7 +253,7 @@ mod tests {
             vec![extension(&strong, "MangaDex", "mangadex")],
         )));
 
-        let found = matcher.find_matches(&ExtensionQuery::new(AIDOKU)).unwrap();
+        let (found, _) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].score, 1.0);
@@ -246,13 +272,8 @@ mod tests {
             ],
         )));
 
-        assert_eq!(
-            matcher
-                .find_matches(&ExtensionQuery::new(AIDOKU))
-                .unwrap()
-                .len(),
-            2
-        );
+        let (found, _) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
+        assert_eq!(found.len(), 2);
     }
 
     #[test]
@@ -264,12 +285,8 @@ mod tests {
             vec![extension(&tachi, "MangaDex", "mangadex")],
         )));
 
-        assert!(
-            matcher
-                .find_matches(&ExtensionQuery::new(AIDOKU))
-                .unwrap()
-                .is_empty()
-        );
+        let (found, _) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
+        assert!(found.is_empty());
     }
 
     #[test]
@@ -290,13 +307,8 @@ mod tests {
         assert_eq!(report.failed[0].repo, broken);
         assert_eq!(report.refreshed, vec![working]);
         // ...and the one queued behind it still ran.
-        assert_eq!(
-            matcher
-                .find_matches(&ExtensionQuery::new(AIDOKU))
-                .unwrap()
-                .len(),
-            1
-        );
+        let (found, _) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
@@ -309,5 +321,39 @@ mod tests {
 
         assert!(report.is_complete());
         assert_eq!(report.refreshed.len(), 2);
+    }
+
+    #[test]
+    fn nan_scores_do_not_panic_the_sort() {
+        let repo = repo_info(AIDOKU, "nan");
+        let mut matcher = ExtensionMatcher::default();
+        matcher.register_repo(Box::new(
+            StubRepo::new(repo.clone(), vec![extension(&repo, "MangaDex", "mangadex")])
+                .scoring(f32::NAN),
+        ));
+
+        let (found, _) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn one_repo_search_failure_does_not_stop_the_rest() {
+        let broken = repo_info(AIDOKU, "broken");
+        let working = repo_info(AIDOKU, "working");
+        let mut matcher = ExtensionMatcher::default();
+        matcher.register_repo(Box::new(
+            StubRepo::new(broken.clone(), vec![extension(&broken, "A", "a")]).search_errors(),
+        ));
+        matcher.register_repo(Box::new(StubRepo::new(
+            working.clone(),
+            vec![extension(&working, "B", "b")],
+        )));
+
+        let (found, failed) = matcher.find_matches(&ExtensionQuery::new(AIDOKU));
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].extension.name, "B");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].repo, broken);
     }
 }

@@ -116,7 +116,7 @@ fn assemble(
         chapters,
         categories,
         sources,
-        date: date(now),
+        date: date_or_epoch(now),
         // Keeps this out of the pool `cleanUpAutoBackups` prunes: an imported
         // backup the app deletes on its own schedule is a nasty surprise.
         automatic: false,
@@ -263,7 +263,7 @@ impl Contents {
                 scanlator: chapter.scanlator.clone(),
                 lang: lang.clone(),
                 chapter: chapter.chapter_number,
-                date_uploaded: chapter.date_uploaded.map(date),
+                date_uploaded: chapter.date_uploaded.and_then(date),
                 source_order: narrow(order),
             });
             order += 1;
@@ -284,7 +284,7 @@ impl Contents {
             }
 
             self.history.push(RawHistory {
-                date_read: date(row.last_read),
+                date_read: date_or_epoch(row.last_read),
                 source_id: source_id.clone(),
                 manga_id: manga_id.clone(),
                 chapter_id: id.to_string(),
@@ -320,10 +320,10 @@ fn library_row(
     }
 
     RawLibraryManga {
-        last_opened: date(last_read.unwrap_or(added)),
-        last_updated: date(added),
-        last_read: last_read.map(date),
-        date_added: date(added),
+        last_opened: date_or_epoch(last_read.unwrap_or(added)),
+        last_updated: date_or_epoch(added),
+        last_read: last_read.and_then(date),
+        date_added: date_or_epoch(added),
         categories,
         manga_id: manga_id.clone(),
         source_id: source_id.clone(),
@@ -353,7 +353,7 @@ fn history_row(chapter: &Chapter, key: &MangaKey) -> Option<RawHistory> {
         // `dateRead` is not optional in the app's decoder, and a chapter read at
         // an unknown time is better placed at the start of the history than at
         // the top of it.
-        date_read: date(chapter.last_read.unwrap_or(Timestamp::UNIX_EPOCH)),
+        date_read: date_or_epoch(chapter.last_read.unwrap_or(Timestamp::UNIX_EPOCH)),
         source_id: source_id.clone(),
         manga_id: manga_id.clone(),
         chapter_id: chapter.id.clone(),
@@ -367,10 +367,13 @@ fn history_row(chapter: &Chapter, key: &MangaKey) -> Option<RawHistory> {
 /// single-language extension really did serve single-language chapters, even
 /// where the Aidoku source it maps onto covers everything.
 fn chapter_lang(source: &Language, target: &Language) -> String {
-    match (source, target) {
-        // What Aidoku itself writes for a chapter whose source never said.
-        (Language::All, Language::All) => String::new(),
-        (Language::All, lang) | (lang, _) => lang.to_code(),
+    let lang = match source {
+        Language::All | Language::Unknown => target,
+        specific @ Language::Tagged { .. } => specific,
+    };
+    match lang {
+        Language::All | Language::Unknown => String::new(),
+        specific @ Language::Tagged { .. } => specific.to_code(),
     }
 }
 
@@ -400,8 +403,18 @@ fn narrow_i32(value: i32) -> i64 {
     i64::from(value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)))
 }
 
-fn date(timestamp: Timestamp) -> plist::Date {
-    std::time::SystemTime::from(timestamp).into()
+fn date(timestamp: Timestamp) -> Option<plist::Date> {
+    // `plist::Date`'s `Serialize` impl panics on a date whose year is before
+    // 0000, which RFC 3339 cannot render. A timestamp that old would come from
+    // a JSON-fallback backup that spelled a pre-epoch date as `dateUploaded`.
+    if timestamp.as_second() < -62_167_219_200 {
+        return None;
+    }
+    Some(std::time::SystemTime::from(timestamp).into())
+}
+
+fn date_or_epoch(timestamp: Timestamp) -> plist::Date {
+    date(timestamp).unwrap_or_else(|| std::time::SystemTime::from(Timestamp::UNIX_EPOCH).into())
 }
 
 /// The IR means "absent" by `None`; a chapter with no title has an empty one.
@@ -596,7 +609,9 @@ mod tests {
     fn identity(backup: &Backup) -> ExtensionMapping {
         let mut mapping = ExtensionMapping::new(Aidoku::ID);
         for extension in &backup.extensions {
-            mapping.insert(Arc::clone(extension), Arc::clone(extension));
+            mapping
+                .insert(Arc::clone(extension), Arc::clone(extension))
+                .unwrap();
         }
         mapping
     }
@@ -753,7 +768,9 @@ mod tests {
         );
 
         let mut mapping = ExtensionMapping::new(Aidoku::ID);
-        mapping.insert(Arc::clone(&mapped), Arc::clone(&mapped));
+        mapping
+            .insert(Arc::clone(&mapped), Arc::clone(&mapped))
+            .unwrap();
 
         let (value, report) = written(&backup, &mapping);
 
@@ -799,7 +816,9 @@ mod tests {
 
         let backup = backup(vec![Arc::clone(&source)], vec![entry("/manga/1", &source)]);
         let mut mapping = ExtensionMapping::new(Aidoku::ID);
-        mapping.insert(Arc::clone(&source), Arc::new(nameless));
+        mapping
+            .insert(Arc::clone(&source), Arc::new(nameless))
+            .unwrap();
 
         let (value, report) = written(&backup, &mapping);
 
@@ -821,8 +840,12 @@ mod tests {
         );
 
         let mut mapping = ExtensionMapping::new(Aidoku::ID);
-        mapping.insert(Arc::clone(&english), Arc::clone(&target));
-        mapping.insert(Arc::clone(&spanish), Arc::clone(&target));
+        mapping
+            .insert(Arc::clone(&english), Arc::clone(&target))
+            .unwrap();
+        mapping
+            .insert(Arc::clone(&spanish), Arc::clone(&target))
+            .unwrap();
 
         let (value, report) = written(&backup, &mapping);
 
@@ -866,7 +889,9 @@ mod tests {
         let backup = backup(vec![Arc::clone(&source)], vec![entry]);
 
         let mut mapping = ExtensionMapping::new(Aidoku::ID);
-        mapping.insert(Arc::clone(&source), Arc::clone(&target));
+        mapping
+            .insert(Arc::clone(&source), Arc::clone(&target))
+            .unwrap();
 
         let (value, _) = written(&backup, &mapping);
         let row = &array(&value, "chapters")[0];
@@ -922,10 +947,73 @@ mod tests {
 
         let (raw, _) = assemble(&backup, &identity(&backup), timestamp(NOW));
 
-        assert_eq!(raw.library[0].date_added, date(timestamp(NOW)));
+        assert_eq!(raw.library[0].date_added, date_or_epoch(timestamp(NOW)));
         // Not optional in the app's decoder, so they have to say something.
-        assert_eq!(raw.library[0].last_opened, date(timestamp(NOW)));
-        assert_eq!(raw.library[0].last_updated, date(timestamp(NOW)));
+        assert_eq!(raw.library[0].last_opened, date_or_epoch(timestamp(NOW)));
+        assert_eq!(raw.library[0].last_updated, date_or_epoch(timestamp(NOW)));
         assert_eq!(raw.library[0].last_read, None);
+    }
+
+    #[test]
+    fn a_date_before_year_0000_degrades_to_the_epoch() {
+        let source = extension("en.mangapill");
+        let mut entry = entry("/manga/1", &source);
+        // -62167219201 is the first second where `date()` returns None.
+        entry.date_added = Timestamp::from_second(-62_167_219_201).ok();
+        let backup = backup(vec![Arc::clone(&source)], vec![entry]);
+
+        let (raw, _) = assemble(&backup, &identity(&backup), timestamp(NOW));
+
+        // The pre-epoch date fell back to the epoch rather than panicking.
+        assert_eq!(raw.library[0].date_added, date_or_epoch(timestamp(0)),);
+        assert_eq!(raw.library[0].last_read, None);
+    }
+
+    #[test]
+    fn an_unknown_source_language_falls_back_to_the_target() {
+        let mangadex = extension("en.mangadex");
+        let mut untyped = mangadex.as_ref().clone();
+        untyped.lang = Language::Unknown;
+        let source = Arc::new(untyped);
+
+        let mut entry = entry("/manga/1", &source);
+        entry.chapters = vec![chapter("/chapters/1")];
+        let backup = backup(vec![Arc::clone(&source)], vec![entry]);
+
+        let mut mapping = ExtensionMapping::new(Aidoku::ID);
+        mapping
+            .insert(Arc::clone(&source), Arc::clone(&mangadex))
+            .unwrap();
+
+        let (value, _) = written(&backup, &mapping);
+        let row = &array(&value, "chapters")[0];
+
+        // Unknown → falls back to target (en) not "all".
+        assert_eq!(field(row, "lang").as_string(), Some("en"));
+    }
+
+    #[test]
+    fn both_sides_unknown_or_all_write_empty_chapter_lang() {
+        let untyped_source = {
+            let mut src = extension("en.mangadex").as_ref().clone();
+            src.lang = Language::Unknown;
+            Arc::new(src)
+        };
+        let all_target = extension("multi.mangadex");
+
+        let mut entry = entry("/manga/1", &untyped_source);
+        entry.chapters = vec![chapter("/chapters/1")];
+        let backup = backup(vec![Arc::clone(&untyped_source)], vec![entry]);
+
+        let mut mapping = ExtensionMapping::new(Aidoku::ID);
+        mapping
+            .insert(Arc::clone(&untyped_source), Arc::clone(&all_target))
+            .unwrap();
+
+        let (value, _) = written(&backup, &mapping);
+        let row = &array(&value, "chapters")[0];
+
+        // Both sides say nothing specific → empty string.
+        assert_eq!(field(row, "lang").as_string(), Some(""));
     }
 }

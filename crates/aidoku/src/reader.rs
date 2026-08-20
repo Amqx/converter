@@ -10,7 +10,7 @@ use converter_core::ir::types::{
 };
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
-use serde::de::{Deserializer, Unexpected, Visitor};
+use serde::de::{Deserializer, Visitor};
 
 use crate::Aidoku;
 
@@ -49,9 +49,18 @@ impl BackupReader for AidokuReader {
 /// Aidoku writes a binary property list and `Backup.load` falls back to JSON,
 /// so a backup old enough to predate the plist still has to read here.
 fn parse(bytes: &[u8]) -> Result<RawBackup, ReadError> {
-    let plist_error = match plist::from_bytes::<RawBackup>(bytes) {
+    let plist_error = match read_plist(bytes) {
         Ok(backup) => return Ok(backup),
-        Err(error) => error,
+        // It opened as a property list, so JSON is not what this file is.
+        Err(PlistFailure::UnrepresentableDate) => {
+            return Err(ReadError::Malformed(
+                "the property list holds a date outside the range a date can \
+                 represent; a source that recorded milliseconds where seconds \
+                 were expected writes one"
+                    .to_string(),
+            ));
+        }
+        Err(PlistFailure::NotAPlist(error)) => error,
     };
 
     serde_json::from_slice(bytes).map_err(|json_error| {
@@ -61,6 +70,38 @@ fn parse(bytes: &[u8]) -> Result<RawBackup, ReadError> {
             "not a property list ({plist_error}) or JSON ({json_error})"
         ))
     })
+}
+
+enum PlistFailure {
+    /// `plist` routes every `Event::Date` through `Date::to_xml_format()`,
+    /// which panics on a date outside the year 0000-9999 window rather than
+    /// returning an error the deserializer could surface. Reaching a date at
+    /// all means the container opened, so this is a bad value in a real
+    /// property list, not a file that was never one.
+    UnrepresentableDate,
+    NotAPlist(plist::Error),
+}
+
+/// Deserializes a property list, turning `plist`'s date panic into a value.
+///
+/// The panic hook is process-wide, so silencing it here also silences a panic
+/// another thread happens to hit in the same window; that is the price of not
+/// printing a backtrace at the user every time they open a corrupt backup.
+/// `catch_unwind` also does nothing under `panic = "abort"`, which the
+/// workspace does not set.
+fn read_plist(bytes: &[u8]) -> Result<RawBackup, PlistFailure> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        plist::from_bytes::<RawBackup>(bytes)
+    }));
+    std::panic::set_hook(previous);
+
+    match result {
+        Ok(Ok(backup)) => Ok(backup),
+        Ok(Err(error)) => Err(PlistFailure::NotAPlist(error)),
+        Err(_) => Err(PlistFailure::UnrepresentableDate),
+    }
 }
 
 fn assemble(raw: RawBackup) -> (Backup, ReadReport) {
@@ -155,6 +196,9 @@ impl Sources {
 
     /// `None` when the id has no installable source behind it, so the caller drops the entry.
     fn resolve(&mut self, id: &str) -> Option<Arc<Extension>> {
+        if id.is_empty() {
+            return None;
+        }
         if let Some(reason) = synthetic_reason(id) {
             self.report(id, reason);
             return None;
@@ -218,10 +262,10 @@ fn extension_for(id: &str) -> Extension {
 fn describe(id: &str) -> (String, Language) {
     match id.split_once('.') {
         Some((prefix, site)) if !site.is_empty() => Language::from_code(prefix).map_or_else(
-            |_| (id.to_string(), Language::All),
+            |_| (id.to_string(), Language::Unknown),
             |lang| (site.to_string(), lang),
         ),
-        _ => (id.to_string(), Language::All),
+        _ => (id.to_string(), Language::Unknown),
     }
 }
 
@@ -269,7 +313,7 @@ fn entry(
                 // field of the chapter, which is the half that went missing.
                 url: None,
                 // A history row whose date we cannot represent carries nothing else, so drop it.
-                last_read: row.date_read?.0,
+                last_read: row.date_read?.0?,
             })
         })
         .collect();
@@ -283,7 +327,7 @@ fn entry(
             (
                 true,
                 library.categories.into_iter().map(CategoryID).collect(),
-                library.date_added.map(|date| date.0),
+                library.date_added.and_then(|date| date.0),
             )
         },
     );
@@ -326,10 +370,12 @@ fn chapter(raw: RawChapter, history: Option<&RawHistory>) -> Chapter {
         // Aidoku records neither when it fetched a chapter nor when it last
         // touched the row; `MangaObject.lastUpdated` is per entry, not per chapter.
         date_fetched: None,
-        date_uploaded: date_uploaded.map(|date| date.0),
+        date_uploaded: date_uploaded.and_then(|date| date.0),
         chapter_number: chapter,
         last_modified: None,
-        last_read: history.and_then(|row| row.date_read).map(|date| date.0),
+        last_read: history
+            .and_then(|row| row.date_read)
+            .and_then(|date| date.0),
     }
 }
 
@@ -481,11 +527,17 @@ impl RawCategory {
 /// it to; the JSON backups older builds wrote spell the same instant as seconds
 /// since the epoch, because `Backup.load` decodes those with
 /// `.secondsSince1970`. Accept either, since the file itself might be either.
+/// An unrepresentable value degrades to `None` rather than rejecting the whole
+/// file: one bad date should not take down every entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BackupDate(Timestamp);
+struct BackupDate(Option<Timestamp>);
 
 impl<'de> Deserialize<'de> for BackupDate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Every `visit_*` below answers `Ok`, so a value this cannot represent
+        // is already a `None` by the time it gets here. What is left is the
+        // document being broken rather than one date in it, and swallowing that
+        // would resume the parser from a position it has lost track of.
         deserializer.deserialize_any(DateVisitor)
     }
 }
@@ -500,39 +552,31 @@ impl Visitor<'_> for DateVisitor {
     }
 
     fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        Timestamp::from_second(value)
-            .map(BackupDate)
-            .map_err(|_| E::invalid_value(Unexpected::Signed(value), &self))
+        Ok(BackupDate(Timestamp::from_second(value).ok()))
     }
 
     fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        i64::try_from(value)
-            .ok()
-            .and_then(|value| Timestamp::from_second(value).ok())
-            .map(BackupDate)
-            .ok_or_else(|| E::invalid_value(Unexpected::Unsigned(value), &self))
+        Ok(BackupDate(
+            i64::try_from(value)
+                .ok()
+                .and_then(|value| Timestamp::from_second(value).ok()),
+        ))
     }
 
     fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-        seconds_since_epoch(value).ok_or_else(|| E::invalid_value(Unexpected::Float(value), &self))
+        Ok(BackupDate(seconds_since_epoch(value)))
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        value
-            .parse()
-            .map(BackupDate)
-            .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+        Ok(BackupDate(value.parse().ok()))
     }
 }
 
 /// Goes through [`std::time::Duration`] rather than casting.
-fn seconds_since_epoch(seconds: f64) -> Option<BackupDate> {
+fn seconds_since_epoch(seconds: f64) -> Option<Timestamp> {
     let elapsed = std::time::Duration::try_from_secs_f64(seconds).ok()?;
     let elapsed = SignedDuration::try_from(elapsed).ok()?;
-    Timestamp::UNIX_EPOCH
-        .checked_add(elapsed)
-        .ok()
-        .map(BackupDate)
+    Timestamp::UNIX_EPOCH.checked_add(elapsed).ok()
 }
 
 #[cfg(test)]
@@ -667,8 +711,9 @@ mod tests {
                 ("asurascans", &Language::from_code("en").unwrap()),
                 // `multi` is Aidoku's spelling of "every language".
                 ("mangadex", &Language::All),
-                // Not `<language>.<site>` at all, so the id is the whole name.
-                ("komga", &Language::All),
+                // Not `<language>.<site>` at all, so the id is the whole name
+                // and the language is absent rather than claimed.
+                ("komga", &Language::Unknown),
             ]
         );
     }
@@ -1187,5 +1232,58 @@ mod tests {
             .filter(|chapter| chapter.read)
             .count();
         assert!(read > 0, "no chapter came back read");
+    }
+
+    #[test]
+    fn an_out_of_range_plist_date_does_not_panic() {
+        // Write a safe date through plist, find the `0x33` tag in
+        // the binary, replace the 8 IEEE-754 bytes after it with
+        // `f64::MAX`, and parse back. The bomb duration is far past
+        // year 9999, so `Date::to_xml_format` panics without
+        // `catch_unwind`.
+        let date: plist::Date = std::time::SystemTime::UNIX_EPOCH.into();
+        let dict = plist::Value::Dictionary(
+            vec![("d".to_string(), plist::Value::Date(date))]
+                .into_iter()
+                .collect(),
+        );
+        let mut bytes = Vec::new();
+        plist::to_writer_binary(&mut bytes, &dict).unwrap();
+
+        // The only date tag byte in this one-key dict is our date.
+        let pos = bytes
+            .iter()
+            .position(|&b| b == 0x33)
+            .expect("a plist with a Date must contain 0x33");
+        bytes[pos + 1..pos + 9].copy_from_slice(&1e15_f64.to_be_bytes());
+
+        let result = AidokuReader::new().read_backup(&bytes);
+        assert!(
+            matches!(result, Err(ReadError::Malformed(_))),
+            "expected a malformed error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_float_date_from_json_degrades_to_none() {
+        // `Backup.load` uses `.secondsSince1970`, so old JSON
+        // backups spell dates as plain floats. A negative one
+        // cannot round-trip through Duration and used to reject
+        // the entire file. Now it degrades to None.
+        let json = r#"{
+            "date": 1700000000,
+            "sources": ["en.asurascans"],
+            "manga": [{ "id": "/series", "sourceId": "en.asurascans",
+                        "title": "/series", "status": 0, "nsfw": 0, "viewer": 0 }],
+            "chapters": [{ "id": "/c1", "sourceId": "en.asurascans",
+                           "mangaId": "/series", "title": "/c1",
+                           "dateUploaded": -86400.5 }]
+        }"#;
+
+        let (backup, _) = AidokuReader::new()
+            .read_backup(json.as_bytes())
+            .expect("a negative float date should not take down the whole file");
+
+        assert_eq!(backup.entries[0].chapters[0].date_uploaded, None);
     }
 }

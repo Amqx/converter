@@ -272,8 +272,11 @@ struct IndexExtension {
 #[serde(rename_all = "camelCase")]
 struct IndexSource {
     id: SourceId,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     language: String,
+    #[serde(default)]
     home_url: String,
     #[serde(default)]
     mirror_urls: Vec<String>,
@@ -609,5 +612,43 @@ mod tests {
         let best = best(&repo, &query);
         assert_eq!(best.extension.name, "MangaDex");
         assert!(best.score >= auto_bar());
+    }
+
+    #[test]
+    fn a_source_without_a_home_url_is_skipped_rather_than_failing_the_whole_index() {
+        let json = r#"{
+            "extensionList": { "extensions": [{
+                "name": "Test", "packageName": "test.pkg",
+                "sources": [
+                    { "id": "a", "name": "Alpha", "language": "en",
+                      "homeUrl": "https://alpha.test" },
+                    { "id": "b", "name": "Beta", "language": "en" },
+                    { "id": "c", "name": "Gamma", "language": "en",
+                      "homeUrl": "https://gamma.test" }
+                ]
+            }]}
+        }"#;
+
+        let mut repo = Keiyoushi::new();
+        repo.load(json)
+            .expect("Beta missing homeUrl should not kill the index");
+
+        let ids: Vec<&str> = repo
+            .index
+            .iter()
+            .map(|s| s.extension.external_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "Beta without homeUrl is still indexed"
+        );
+        // Its url is empty because there was nothing to record.
+        let beta = repo
+            .index
+            .iter()
+            .find(|s| s.extension.external_id == "b")
+            .unwrap();
+        assert!(beta.extension.url.is_empty());
     }
 }

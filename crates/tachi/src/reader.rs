@@ -10,7 +10,7 @@ use converter_core::io::{ReadError, SkippedExtension};
 use converter_core::ir::types::{
     Backup, Category, CategoryID, Chapter, History, Manga, MangaStatus,
 };
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use jiff::Timestamp;
 use prost::Message as _;
 
@@ -66,7 +66,7 @@ fn decompress_within(bytes: &[u8], max: usize) -> Result<Cow<'_, [u8]>, ReadErro
     // tells the two cases apart: a backup that stops short of it decompressed cleanly.
     let mut out = Vec::new();
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
-    let read = GzDecoder::new(bytes)
+    let read = MultiGzDecoder::new(bytes)
         .take(limit.saturating_add(1))
         .read_to_end(&mut out)
         .map_err(|error| ReadError::Decompress(error.to_string()))?;
@@ -241,6 +241,13 @@ fn entry(wire: protos::BackupManga, extension: Arc<Extension>) -> Manga {
         categories,
         favorite,
         history,
+        custom_title,
+        custom_artist,
+        custom_author,
+        custom_description,
+        custom_genre,
+        custom_thumbnail_url,
+        custom_status,
         ..
     } = wire;
 
@@ -252,6 +259,8 @@ fn entry(wire: protos::BackupManga, extension: Arc<Extension>) -> Manga {
         .map(|entry| (entry.url.as_str(), entry.last_read))
         .collect();
 
+    let mut chapters = chapters;
+    chapters.sort_by_key(|c| c.source_order.unwrap_or(0));
     let chapters: Vec<Chapter> = chapters
         .into_iter()
         .map(|chapter_wire| chapter(chapter_wire, &read_at))
@@ -274,25 +283,29 @@ fn entry(wire: protos::BackupManga, extension: Arc<Extension>) -> Manga {
 
     Manga {
         id: url,
-        title: title.unwrap_or_default(),
+        title: custom_title.or(title).unwrap_or_default(),
         extension,
-        status: manga_status(status.unwrap_or_default()),
+        status: manga_status(custom_status.or(status).unwrap_or_default()),
         // Tachiyomi tracks NSFW per source, not per entry, and the backup carries neither.
         nsfw: false,
         // `BackupManga.favorite` defaults to true in Kotlin: a backed-up entry is in the library
         // unless it says otherwise.
         favorite: favorite.unwrap_or(true),
-        author: non_empty(author),
-        artist: non_empty(artist),
-        description: non_empty(description),
+        author: non_empty(custom_author.or(author)),
+        artist: non_empty(custom_artist.or(artist)),
+        description: non_empty(custom_description.or(description)),
         chapters,
         history: orphaned,
-        tags: genre,
+        tags: if custom_genre.is_empty() {
+            genre
+        } else {
+            custom_genre
+        },
         categories: categories
             .into_iter()
             .map(|order| CategoryID(order.to_string()))
             .collect(),
-        cover_url: non_empty(thumbnail_url),
+        cover_url: non_empty(custom_thumbnail_url.or(thumbnail_url)),
         date_added: timestamp(date_added),
     }
 }
@@ -307,7 +320,7 @@ fn chapter(wire: protos::BackupChapter, read_at: &HashMap<&str, i64>) -> Chapter
         scanlator: non_empty(wire.scanlator),
         date_fetched: timestamp(wire.date_fetch),
         date_uploaded: timestamp(wire.date_upload),
-        chapter_number: wire.chapter_number.map(f64::from),
+        chapter_number: wire.chapter_number.map(f64::from).filter(|&n| n >= 0.0),
         last_modified: timestamp(wire.last_modified_at),
         last_read: timestamp(last_read),
         id: wire.url,
@@ -338,10 +351,11 @@ const fn manga_status(value: i32) -> MangaStatus {
     }
 }
 
-/// Tachiyomi writes 0 for "never", which is a real instant to `jiff` but not a real date here.
+/// Tachiyomi writes 0 for "never" and -1 for "not set", which are sentinels,
+/// not real instants.
 fn timestamp(millis: Option<i64>) -> Option<Timestamp> {
     match millis {
-        Some(millis) if millis != 0 => Timestamp::from_millisecond(millis).ok(),
+        Some(millis) if millis > 0 => Timestamp::from_millisecond(millis).ok(),
         _ => None,
     }
 }
@@ -803,5 +817,115 @@ mod tests {
             "{dangling} of {} category refs dangle",
             refs.len()
         );
+    }
+
+    #[test]
+    fn chapters_sort_by_source_order() {
+        let mut c1 = chapter_wire("/c1");
+        c1.source_order = Some(2);
+        let mut c2 = chapter_wire("/c2");
+        c2.source_order = Some(0);
+        let mut c3 = chapter_wire("/c3");
+        c3.source_order = Some(1);
+
+        let mut entry = manga(9001, "/series");
+        entry.chapters = vec![c1, c2, c3];
+
+        let wire = protos::Backup {
+            backup_manga: vec![entry],
+            ..Default::default()
+        };
+        let (backup, _) = read(&wire);
+
+        let ids: Vec<&str> = backup.entries[0]
+            .chapters
+            .iter()
+            .map(|chapter| chapter.id.as_str())
+            .collect();
+        assert_eq!(ids, ["/c2", "/c3", "/c1"]);
+    }
+
+    #[test]
+    fn a_negative_chapter_number_reads_as_none() {
+        let mut chapter = chapter_wire("/c1");
+        chapter.chapter_number = Some(-1.0_f32);
+
+        let mut entry = manga(9001, "/series");
+        entry.chapters = vec![chapter];
+
+        let wire = protos::Backup {
+            backup_manga: vec![entry],
+            ..Default::default()
+        };
+        let (backup, _) = read(&wire);
+
+        assert_eq!(backup.entries[0].chapters[0].chapter_number, None);
+    }
+
+    #[test]
+    fn negative_and_zero_millis_are_not_real_dates() {
+        let mut entry = manga(9001, "/series");
+        // 0 is "never", -1 is "not set".
+        entry.date_added = Some(-1);
+        let history = protos::BackupHistory {
+            url: "/series/c1".to_string(),
+            last_read: 0,
+            read_duration: None,
+        };
+        entry.history = vec![history];
+
+        let mut chapter = chapter_wire("/series/c1");
+        chapter.date_upload = Some(-1);
+        chapter.date_fetch = Some(0);
+        entry.chapters = vec![chapter];
+
+        let wire = protos::Backup {
+            backup_manga: vec![entry],
+            ..Default::default()
+        };
+        let (backup, _) = read(&wire);
+
+        assert_eq!(backup.entries[0].date_added, None);
+        assert_eq!(backup.entries[0].chapters[0].date_uploaded, None);
+        assert_eq!(backup.entries[0].chapters[0].date_fetched, None);
+    }
+
+    #[test]
+    fn custom_fields_override_their_original() {
+        let mut entry = manga(9001, "/series");
+        entry.title = Some("Original Title".to_string());
+        entry.custom_title = Some("Custom Title".to_string());
+        entry.author = Some("Original Author".to_string());
+        entry.custom_author = Some("Custom Author".to_string());
+        entry.artist = Some("Original Artist".to_string());
+        entry.custom_artist = Some("Custom Artist".to_string());
+        entry.description = Some("Original Desc".to_string());
+        entry.custom_description = Some("Custom Desc".to_string());
+        entry.thumbnail_url = Some("https://example.test/orig.jpg".to_string());
+        entry.custom_thumbnail_url = Some("https://example.test/custom.jpg".to_string());
+        entry.status = Some(1); // Ongoing
+        entry.custom_status = Some(2); // Completed
+        entry.genre = vec!["Action".to_string()];
+        entry.custom_genre = vec!["Drama".to_string()];
+
+        let wire = protos::Backup {
+            backup_manga: vec![entry],
+            ..Default::default()
+        };
+        let (backup, _) = read(&wire);
+        let entry = &backup.entries[0];
+
+        assert_eq!(entry.title, "Custom Title");
+        assert_eq!(entry.author.as_deref(), Some("Custom Author"));
+        assert_eq!(entry.artist.as_deref(), Some("Custom Artist"));
+        assert_eq!(entry.description.as_deref(), Some("Custom Desc"));
+        assert_eq!(
+            entry.cover_url.as_deref(),
+            Some("https://example.test/custom.jpg")
+        );
+        assert_eq!(entry.status, MangaStatus::Completed);
+        assert_eq!(entry.tags, vec!["Drama"]);
+        // date_added has no custom counterpart; the original survives.
+        assert!(entry.date_added.is_none());
     }
 }

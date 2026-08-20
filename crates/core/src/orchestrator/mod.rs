@@ -1,6 +1,7 @@
 pub mod mapping;
 pub mod policy;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -29,20 +30,13 @@ pub enum OrchestratorError {
     #[error("resolution policy aborted on extension '{extension}'")]
     ResolutionAborted { extension: String },
     #[error(
-        "a repository serving {expected} returned extension '{extension}', \
-         which belongs to {found}"
-    )]
-    ForeignExtension {
-        extension: String,
-        expected: ReaderID,
-        found: ReaderID,
-    },
-    #[error(
         "entry '{entry}' references extension '{extension}', which is not in the \
          backup's extension table; the reader must share one `Arc<Extension>` \
          between `Backup::extensions` and the entries that use it"
     )]
     UnknownEntryExtension { entry: String, extension: String },
+    #[error(transparent)]
+    Mapping(#[from] mapping::MappingError),
     #[error(transparent)]
     Extensions(#[from] ExtensionError),
     #[error(transparent)]
@@ -100,28 +94,46 @@ impl Orchestrator {
     }
 
     pub fn register_reader(&mut self, reader: Box<dyn BackupReader>) {
+        let id = reader.reader();
+        assert!(
+            !self.readers.iter().any(|r| r.reader() == id),
+            "reader '{}' is already registered; each format id must name \
+             exactly one format, not two",
+            id.0
+        );
         self.readers.push(reader);
     }
 
     pub fn register_writer(&mut self, writer: Box<dyn BackupWriter>) {
+        let id = writer.reader();
+        assert!(
+            !self.writers.iter().any(|w| w.reader() == id),
+            "writer '{}' is already registered; each format id must name \
+             exactly one format, not two",
+            id.0
+        );
         self.writers.push(writer);
     }
 
     /// Reader, writer and repositories in one go.
     pub fn register_format<F: BackupFormat>(&mut self) {
         let reader = F::reader();
+        let id = F::id();
         assert_eq!(
             reader.reader(),
-            F::id(),
+            id,
             "reader reports a different format than it was registered under; \
              check the `format_id!` in its `BackupReader` impl"
         );
+
+        // `register_reader` and `register_writer` each reject an id they
+        // already hold, so registering the same format twice panics there.
         self.register_reader(reader);
 
         if let Some(writer) = F::writer() {
             assert_eq!(
                 writer.reader(),
-                F::id(),
+                id,
                 "writer reports a different format than it was registered under; \
                  check the `format_id!` in its `BackupWriter` impl"
             );
@@ -159,22 +171,25 @@ impl Orchestrator {
 
         for extension in &backup.extensions {
             let query = ExtensionQuery::equivalent_of(extension, to);
-            let candidates = self.matcher.find_matches(&query)?;
+            let (mut candidates, failed) = self.matcher.find_matches(&query);
+
+            // A repo that cannot be searched is a recoverable loss like any
+            // other: its candidates are missing, so record it and let the rest
+            // of the query stand. Without this the extensions it would have
+            // matched look absent from the target app rather than unsearched.
+            for failure in failed {
+                mapping.mark_repo_failed(failure.repo, &failure.error);
+            }
+
+            // A repo covering several apps can hand back an extension whose own
+            // `reader` differs from the target app. Writing that out gives the
+            // user a backup pointing at a source they can't install, so drop
+            // those candidates and let the policy work with what remains.
+            candidates.retain(|m| m.extension.reader == to);
 
             match self.policy.resolve(extension, &candidates) {
                 Resolution::Use(target) => {
-                    // find_matches filters on the repo's declared app, not the
-                    // extension's own, so a repo covering several apps can hand
-                    // back a foreign one. Writing that out gives the user a
-                    // backup pointing at an extension they can't install.
-                    if target.reader != to {
-                        return Err(OrchestratorError::ForeignExtension {
-                            extension: target.name.clone(),
-                            expected: to,
-                            found: target.reader,
-                        });
-                    }
-                    mapping.insert(Arc::clone(extension), target);
+                    mapping.insert(Arc::clone(extension), target)?;
                 }
                 Resolution::Skip => {
                     let reason = if candidates.is_empty() {
@@ -218,7 +233,10 @@ impl Orchestrator {
         }
 
         backup.entries = kept;
-        backup.extensions.retain(|ext| mapping.get(ext).is_some());
+        let used: HashSet<_> = backup.entries.iter().map(|e| &e.extension).collect();
+        backup
+            .extensions
+            .retain(|ext| mapping.get(ext).is_some() && used.contains(ext));
 
         report
     }
@@ -620,21 +638,150 @@ mod tests {
     }
 
     #[test]
-    fn candidate_from_another_app_is_rejected() {
+    fn candidate_from_another_app_is_filtered_out() {
         // Registered as an Aidoku repo, but indexing a Tachiyomi extension.
+        // The foreign candidate is silently discarded; the source ends up
+        // unresolved with NoCandidates instead of aborting the whole conversion.
         let orchestrator = orchestrator(
             vec![extension(TACHI, "MangaDex", "mangadex")],
             Box::new(AutoBest::default()),
         );
         let (backup, _, _) = fixture();
 
+        let mapping = orchestrator.resolve(&backup, AIDOKU).unwrap();
+
+        assert!(!mapping.is_fully_resolved());
+        assert_eq!(
+            mapping.unresolved()[0].reason,
+            UnresolvedReason::NoCandidates
+        );
+    }
+
+    #[test]
+    fn inserting_a_mapping_clears_unresolved() {
+        let orchestrator = orchestrator(
+            vec![extension(AIDOKU, "MangaDex", "mangadex")],
+            Box::new(AutoBest::default()),
+        );
+        let (backup, _matched, _) = fixture();
+
+        // Step 1: resolve normally — MangaDex maps, the orphan is unresolved.
+        let mut mapping = orchestrator.resolve(&backup, AIDOKU).unwrap();
+        assert!(!mapping.is_fully_resolved());
+        assert_eq!(mapping.unresolved().len(), 1);
+
+        // Step 2: the user manually maps the orphaned extension.
+        let orphan = Arc::clone(&mapping.unresolved()[0].extension);
+        mapping
+            .insert(orphan, extension(AIDOKU, "OtherApp", "other"))
+            .unwrap();
+
+        assert!(mapping.is_fully_resolved());
+        assert_eq!(mapping.unresolved().len(), 0);
+    }
+
+    #[test]
+    fn prune_drops_unused_but_resolved_extensions() {
+        let orchestrator = orchestrator(
+            vec![extension(AIDOKU, "MangaDex", "mangadex")],
+            Box::new(AutoBest::default()),
+        );
+        let (mut backup, matched, _) = fixture();
+
+        // Keep only the orphan entry so MangaDex resolves but nothing uses it.
+        backup.entries.retain(|entry| entry.extension != matched);
+
+        let mapping = orchestrator.resolve(&backup, AIDOKU).unwrap();
+        orchestrator.prune(&mut backup, &mapping);
+
+        // MangaDex was resolved but had no entries — it should be gone.
+        assert!(backup.extensions.iter().all(|ext| ext.name != "MangaDex"));
+    }
+
+    /// A repo whose index will not answer is a reported loss, not a fatal one -
+    /// and the report has to reach the mapping, or every extension it would
+    /// have matched is indistinguishable from one the target app lacks.
+    #[test]
+    fn a_repository_that_cannot_be_searched_is_recorded_on_the_mapping() {
+        struct BrokenRepo(ExtensionRepositoryInfo);
+
+        impl ExtensionRepository for BrokenRepo {
+            fn info(&self) -> &ExtensionRepositoryInfo {
+                &self.0
+            }
+
+            fn search(&self, _query: &ExtensionQuery) -> ExtResult<Vec<ExtensionMatch>> {
+                Err(ExtensionError::MalformedIndex {
+                    repo: "broken".into(),
+                    message: "index did not parse".into(),
+                })
+            }
+        }
+
+        let mut matcher = ExtensionMatcher::default();
+        matcher.register_repo(Box::new(BrokenRepo(repo_info(AIDOKU))));
+        let (backup, _, _) = fixture();
+        let orchestrator = Orchestrator::new(matcher, Box::new(AutoBest::default()));
+
+        let mapping = orchestrator.resolve(&backup, AIDOKU).unwrap();
+
+        // Recorded once, though both of the backup's extensions hit it.
+        assert_eq!(mapping.search_failures().len(), 1);
+        assert_eq!(mapping.search_failures()[0].repo, repo_info(AIDOKU));
+        assert!(mapping.search_failures()[0].error.contains("did not parse"));
+        assert_eq!(mapping.unresolved().len(), backup.extensions.len());
+    }
+
+    /// A hand-built mapping has no `resolve` filtering candidates for it, so
+    /// `insert` is the last place a foreign extension can be turned away before
+    /// the writer emits a source the user cannot install.
+    #[test]
+    fn inserting_a_foreign_extension_is_refused() {
+        let mut mapping = ExtensionMapping::new(AIDOKU);
+        let source = extension(TACHI, "MangaDex", "mangadex");
+
+        let refused = mapping.insert(
+            Arc::clone(&source),
+            extension(TACHI, "MangaDex", "mangadex"),
+        );
+
         assert!(matches!(
-            orchestrator.resolve(&backup, AIDOKU),
-            Err(OrchestratorError::ForeignExtension {
-                expected: AIDOKU,
+            refused,
+            Err(mapping::MappingError::ForeignExtension {
+                target: AIDOKU,
                 found: TACHI,
                 ..
             })
         ));
+        assert!(mapping.get(&source).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered")]
+    fn duplicate_reader_id_panics_at_registration() {
+        struct TestReader;
+        impl BackupReader for TestReader {
+            fn reader(&self) -> ReaderID {
+                ReaderID("dupe")
+            }
+            fn read_backup(&self, _bytes: &[u8]) -> Result<(Backup, ReadReport), ReadError> {
+                Ok((
+                    Backup {
+                        reader: ReaderID("dupe"),
+                        version: None,
+                        extensions: Vec::new(),
+                        entries: Vec::new(),
+                        categories: Vec::new(),
+                    },
+                    ReadReport::default(),
+                ))
+            }
+        }
+
+        let mut orchestrator =
+            Orchestrator::new(ExtensionMatcher::default(), Box::new(AutoBest::default()));
+
+        orchestrator.register_reader(Box::new(TestReader));
+        orchestrator.register_reader(Box::new(TestReader));
     }
 }

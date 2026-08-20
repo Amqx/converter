@@ -55,6 +55,26 @@ fn scalar(kotlin: &str) -> Option<&'static str> {
     })
 }
 
+/// How many fields a class body declares, counted independently of the FIELD
+/// regex so the two can be compared. A commented-out field is a number the fork
+/// retired rather than one that went missing, so it is not a declaration.
+fn declarations(defs: &str) -> usize {
+    defs.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                return false;
+            }
+            // Either the declaration opens the line, or an annotation does and
+            // the declaration follows the `)` that closes it.
+            trimmed.starts_with("var ")
+                || trimmed.starts_with("val ")
+                || trimmed.contains(") var ")
+                || trimmed.contains(") val ")
+        })
+        .count()
+}
+
 /// Turns every data class in one Kotlin file into a protobuf message.
 pub fn parse_model(source: &str) -> Result<String, SchemaError> {
     let class = Regex::new(CLASS)?;
@@ -66,6 +86,7 @@ pub fn parse_model(source: &str) -> Result<String, SchemaError> {
             continue;
         };
         let _ = writeln!(out, "message {} {{", name.as_str());
+        let mut written = 0usize;
 
         for param in field.captures_iter(defs.as_str()) {
             let Some(ident) = param.name("name") else {
@@ -89,6 +110,27 @@ pub fn parse_model(source: &str) -> Result<String, SchemaError> {
             let number = param.name("number").map_or("1", |m| m.as_str());
 
             let _ = writeln!(out, "  {label} {ty} {} = {number};", ident.as_str());
+            written += 1;
+        }
+
+        // An indented `var`/`val` the FIELD regex cannot reach is invisible: its
+        // three alternatives are `^\s*@ProtoNumber(N)\s*`, `data class \w+\(`
+        // and a bare `^`, so a field whose annotation does not sit immediately
+        // before it matches nothing at all. kotlinx.serialization numbers such a
+        // field implicitly and real backups carry it, so dropping it silently
+        // produces bindings that cannot see it. Counting the declarations in the
+        // class body and insisting every one produced a line catches the case
+        // that matters - one unannotated field among annotated ones - which
+        // comparing against zero would not.
+        let declared = declarations(defs.as_str());
+        if declared != written {
+            return Err(SchemaError::Codegen(format!(
+                "{} declares {declared} field{} but {written} reached the schema; \
+                 every `var`/`val` in the class body needs a `@ProtoNumber` \
+                 annotation directly before it",
+                name.as_str(),
+                if declared == 1 { "" } else { "s" },
+            )));
         }
 
         out.push_str("}\n\n");
@@ -265,6 +307,24 @@ data class BackupManga(
         let proto = parse_model(kt).unwrap();
         assert!(proto.contains("optional UpdateStrategy updateStrategy = 105;"));
         assert!(proto.contains("optional BackupFlatMetadata flatMetadata = 601;"));
+    }
+
+    /// The case that actually happens: SY adds one field to a class that is
+    /// otherwise annotated. The regex cannot see it, and emitting the rest
+    /// anyway would produce bindings blind to a field real backups carry.
+    #[test]
+    fn one_unannotated_field_among_annotated_ones_is_an_error() {
+        let kt = r#"
+data class BackupSource(
+    @ProtoNumber(1) var name: String = "",
+    var sourceId: Long = 0,
+)
+"#;
+        let error = parse_model(kt).unwrap_err();
+        assert!(
+            matches!(&error, SchemaError::Codegen(message) if message.contains("declares 2 fields")),
+            "expected a codegen error naming the count, got {error:?}"
+        );
     }
 
     #[test]

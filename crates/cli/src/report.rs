@@ -1,6 +1,10 @@
 //! Rendering the pipeline's reports. Everything a conversion gave up on is
 //! reported rather than errored, so the terminal is where the user finds out.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use converter_core::ReaderID;
 use converter_core::extensions::lang::Language;
 use converter_core::extensions::matcher::RefreshReport;
 use converter_core::extensions::types::Extension;
@@ -9,9 +13,9 @@ use converter_core::io::writer::WriteReport;
 use converter_core::orchestrator::PruneReport;
 use converter_core::orchestrator::mapping::{ExtensionMapping, UnresolvedReason};
 
-/// Name and language, which together are what tells two extensions apart. The
-/// language as a code rather than as a name, because that is how both apps
-/// label the source in their own extension lists.
+/// Name and language, which is how both apps label a source in their own
+/// extension lists. The language as a code rather than as a name, for the same
+/// reason.
 pub fn extension(extension: &Extension) -> String {
     if extension.lang == Language::Unknown {
         // `to_code` answers "all" here, and the backup never said that.
@@ -20,7 +24,39 @@ pub fn extension(extension: &Extension) -> String {
     format!("{} ({})", extension.name, extension.lang.to_code())
 }
 
-pub fn refresh(report: &RefreshReport) {
+/// The same label with the source id appended, for extensions a name alone
+/// cannot tell apart.
+fn extension_with_id(extension: &Extension) -> String {
+    format!("{} [{}]", self::extension(extension), extension.external_id)
+}
+
+/// Labels for one list, spelling out the id only where the plain label would
+/// repeat. A backup carrying two Comicks, or two sources whose names are both
+/// empty because it had no `backupSources`, needs them told apart; the twenty
+/// rows around them do not, and a source id on every line buries the ones that
+/// matter.
+pub fn labels<'a>(extensions: impl IntoIterator<Item = &'a Extension>) -> Vec<String> {
+    let extensions: Vec<&Extension> = extensions.into_iter().collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for ext in &extensions {
+        *seen.entry(extension(ext)).or_default() += 1;
+    }
+
+    extensions
+        .iter()
+        .map(|ext| {
+            let plain = extension(ext);
+            if seen.get(&plain).is_some_and(|count| *count > 1) {
+                extension_with_id(ext)
+            } else {
+                plain
+            }
+        })
+        .collect()
+}
+
+pub fn refresh(report: &RefreshReport, for_reader: ReaderID) {
     for failure in &report.failed {
         let name = failure
             .repo
@@ -30,14 +66,22 @@ pub fn refresh(report: &RefreshReport) {
         println!("warning: could not refresh {name}: {}", failure.error);
     }
 
-    if !report.is_complete() {
-        // Worth saying outright: an unindexed extension and a missing one look
-        // exactly alike by the time resolution is done with them.
+    let relevant_failures = report
+        .failed
+        .iter()
+        .filter(|f| f.repo.reader == for_reader)
+        .count();
+    let relevant_total = report
+        .refreshed
+        .iter()
+        .filter(|r| r.reader == for_reader)
+        .count()
+        + relevant_failures;
+
+    if relevant_failures > 0 {
         println!(
-            "warning: {} of {} repositories are out of date, so extensions may look missing \
-             that are only unindexed",
-            report.failed.len(),
-            report.failed.len() + report.refreshed.len()
+            "warning: {relevant_failures} of {relevant_total} repositories for the target \
+             app are out of date, so extensions may look missing that are only unindexed"
         );
     }
 }
@@ -60,10 +104,34 @@ pub fn read(report: &ReadReport) {
 }
 
 pub fn mapping(mapping: &ExtensionMapping, verbose: bool) {
-    let mut resolved: Vec<(String, String)> = mapping
-        .resolved()
-        .map(|(source, target)| (extension(source), extension(target)))
-        .collect();
+    for failure in mapping.search_failures() {
+        let name = failure
+            .repo
+            .name
+            .clone()
+            .unwrap_or_else(|| failure.repo.reader.to_string());
+        // Otherwise the extensions it would have matched are indistinguishable
+        // from ones the target app genuinely does not have.
+        println!(
+            "warning: could not search {name}: {}; anything it indexes is \
+             missing from the mapping below",
+            failure.error
+        );
+    }
+
+    // Collected once: `resolved()` walks a `HashMap`, so a second pass would
+    // hand back a different order and the labels would stop lining up.
+    let pairs: Vec<(&Arc<Extension>, &Arc<Extension>)> = mapping.resolved().collect();
+    let sources = labels(
+        pairs
+            .iter()
+            .map(|(source, _)| source.as_ref())
+            .chain(mapping.unresolved().iter().map(|u| u.extension.as_ref())),
+    );
+    let (mapped, unmapped) = sources.split_at(pairs.len());
+    let targets = labels(pairs.iter().map(|(_, target)| target.as_ref()));
+
+    let mut resolved: Vec<(String, String)> = mapped.iter().cloned().zip(targets).collect();
     resolved.sort();
 
     println!(
@@ -86,7 +154,8 @@ pub fn mapping(mapping: &ExtensionMapping, verbose: bool) {
     let mut unresolved: Vec<(String, String)> = mapping
         .unresolved()
         .iter()
-        .map(|u| {
+        .zip(unmapped)
+        .map(|(u, label)| {
             let reason = match u.reason {
                 UnresolvedReason::NoCandidates => "nothing in the target app matched".to_string(),
                 UnresolvedReason::Declined { candidates: 1 } => {
@@ -96,7 +165,7 @@ pub fn mapping(mapping: &ExtensionMapping, verbose: bool) {
                     format!("{candidates} candidates, none accepted")
                 }
             };
-            (extension(&u.extension), reason)
+            (label.clone(), reason)
         })
         .collect();
     unresolved.sort();

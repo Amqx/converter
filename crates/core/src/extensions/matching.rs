@@ -89,20 +89,46 @@ pub fn host_of(url: &str) -> Option<String> {
 const SECOND_LEVEL_SUFFIXES: [&str; 9] =
     ["com", "co", "net", "org", "edu", "gov", "ac", "ne", "or"];
 
+/// Hosting platforms that hand every group a label under one shared domain, so
+/// the domain identifies nobody and the label above it is the site. Matched on
+/// the label alone rather than on the whole suffix, because the same platform
+/// is served under many tlds - `blogspot.com`, `blogspot.co.id` and
+/// `blogspot.com.br` are all Blogger, and a list of suffixes would have to
+/// spell out every one of them.
+const PLATFORM_LABELS: [&str; 13] = [
+    "blogspot",
+    "github",
+    "gitlab",
+    "wordpress",
+    "tumblr",
+    "pages",
+    "vercel",
+    "netlify",
+    "neocities",
+    "herokuapp",
+    "onrender",
+    "glitch",
+    "web",
+];
+
 /// Whether two hosts look like the same site wearing a different tld - the
 /// usual shape of a scanlator that moved between one backup and the next.
 pub fn same_site(a: &str, b: &str) -> bool {
     fn site_label(host: &str) -> Option<&str> {
+        // Walking from the tld inwards: each step below is part of the suffix
+        // rather than part of the site, so the label after them is the site.
         let mut labels = host.rsplit('.');
         labels.next()?;
-        let candidate = labels.next()?;
-        let label = if SECOND_LEVEL_SUFFIXES.contains(&candidate) {
-            labels.next()?
-        } else {
-            candidate
-        };
+        let mut candidate = labels.next()?;
 
-        (label.len() >= 3).then_some(label)
+        if SECOND_LEVEL_SUFFIXES.contains(&candidate) {
+            candidate = labels.next()?;
+        }
+        if PLATFORM_LABELS.contains(&candidate) {
+            candidate = labels.next()?;
+        }
+
+        (candidate.len() >= 3).then_some(candidate)
     }
 
     matches!((site_label(a), site_label(b)), (Some(a), Some(b)) if a == b)
@@ -158,6 +184,49 @@ mod tests {
         assert!(!same_site("asurascans.com.tr", "holyscans.com.tr"));
         assert!(!same_site("alphapolis.co.jp", "book.dmm.co.jp"));
         assert!(!same_site("mangadex.co.uk", "comick.co.uk"));
+    }
+
+    /// Platforms like Blogger and GitHub Pages are where unrelated scanlators
+    /// happen to be hosted, not a site that moved.
+    #[test]
+    fn a_platform_suffix_is_not_a_shared_site() {
+        assert!(!same_site(
+            "komikcast.blogspot.com",
+            "mangaindo.blogspot.com"
+        ));
+        assert!(!same_site("mangax.github.io", "mangay.github.io"));
+        assert!(!same_site("scan-a.pages.dev", "scan-b.pages.dev"));
+        assert!(!same_site("grupo1.neocities.org", "grupo2.neocities.org"));
+        assert!(!same_site("a.vercel.app", "b.vercel.app"));
+        assert!(!same_site("groupa.wordpress.com", "groupb.wordpress.com"));
+        assert!(!same_site("groupa.tumblr.com", "groupb.tumblr.com"));
+        assert!(!same_site("groupa.netlify.app", "groupb.netlify.app"));
+        assert!(!same_site("groupa.herokuapp.com", "groupb.herokuapp.com"));
+    }
+
+    /// Blogger serves the same blog under a per-region domain, and the regional
+    /// ones put a ccSLD between the platform and the tld. Reading only the two
+    /// trailing labels stops at `blogspot`, which every group on the platform
+    /// shares.
+    #[test]
+    fn a_platform_under_a_country_tld_is_still_a_platform() {
+        assert!(!same_site(
+            "komikcast.blogspot.co.id",
+            "mangaindo.blogspot.co.id"
+        ));
+        assert!(!same_site(
+            "komikcast.blogspot.com.br",
+            "mangaindo.blogspot.com.br"
+        ));
+        assert!(!same_site("komikcast.blogspot.jp", "mangaindo.blogspot.jp"));
+    }
+
+    /// The bonus is only worth having if a genuine move still earns it.
+    #[test]
+    fn a_site_that_only_changed_tld_is_still_the_same_site() {
+        assert!(same_site("mangadex.org", "mangadex.net"));
+        assert!(same_site("asurascans.com", "asurascans.gg"));
+        assert!(same_site("read.mangadex.org", "mangadex.net"));
     }
 
     #[test]

@@ -1,16 +1,18 @@
 //! What each subcommand actually does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use converter_aidoku::Aidoku;
+use converter_core::extensions::types::Extension;
 use converter_core::ir::types::Backup;
 use converter_core::orchestrator::OrchestratorError;
 use converter_core::orchestrator::policy::AutoBest;
 use converter_tachi::Tachiyomi;
 
-use crate::cli::{ConvertArgs, InspectArgs};
+use crate::cli::{ConvertArgs, InspectArgs, PolicyKind};
 use crate::formats::{self, Format};
 use crate::report;
 
@@ -38,6 +40,12 @@ pub enum CliError {
     OutputIsInput,
     #[error("{path} already exists; pass --force to overwrite it")]
     OutputExists { path: String },
+    #[error("{path} does not exist, so there is nowhere to write the output")]
+    OutputParentMissing { path: String },
+    #[error(
+        "every entry was dropped ({dropped} of {total}); nothing but categories would be written"
+    )]
+    AllEntriesDropped { dropped: usize, total: usize },
     #[error(transparent)]
     Pipeline(#[from] OrchestratorError),
 }
@@ -55,15 +63,43 @@ pub async fn convert(args: ConvertArgs) -> CliResult<()> {
     let output = args
         .output
         .unwrap_or_else(|| default_output(&args.input, &target));
-    if !args.dry_run {
-        if same_file(&args.input, &output) {
+    let same = same_file(&args.input, &output);
+    let exists = output.exists();
+
+    if same {
+        if args.dry_run {
+            println!(
+                "warning: --output is the input backup; a real run would refuse to overwrite it"
+            );
+        } else {
             return Err(CliError::OutputIsInput);
         }
-        if output.exists() && !args.force {
+    }
+    if exists && !same {
+        if args.dry_run {
+            println!(
+                "warning: {} already exists; a real run would need --force to overwrite it",
+                output.display()
+            );
+        } else if !args.force {
             return Err(CliError::OutputExists {
                 path: output.display().to_string(),
             });
         }
+    }
+    if !args.dry_run
+        && let Some(parent) = output_parent(&output)
+        && !parent.exists()
+    {
+        return Err(CliError::OutputParentMissing {
+            path: parent.display().to_string(),
+        });
+    }
+
+    if args.policy == PolicyKind::Strict
+        && (args.min_score - AutoBest::default().min_score).abs() > f32::EPSILON
+    {
+        eprintln!("warning: --min-score has no effect with --policy strict");
     }
 
     // Likewise, parse the backup before going near the network: one this build
@@ -80,7 +116,7 @@ pub async fn convert(args: ConvertArgs) -> CliResult<()> {
     report::read(&read);
 
     let refresh = orchestrator.refresh().await;
-    report::refresh(&refresh);
+    report::refresh(&refresh, target.id);
 
     let mapping = orchestrator.resolve(&backup, target.id)?;
     report::mapping(&mapping, args.verbose);
@@ -98,10 +134,12 @@ pub async fn convert(args: ConvertArgs) -> CliResult<()> {
     }
     report::prune(&prune, backup.entries.len());
 
-    // `strict` against two apps that number their sources differently maps
-    // nothing at all, and an empty backup is a quiet way to find that out.
+    let total = backup.entries.len() + prune.dropped();
     if backup.entries.is_empty() && prune.dropped() > 0 {
-        println!("warning: every entry was dropped; the file will hold nothing but categories");
+        return Err(CliError::AllEntriesDropped {
+            dropped: prune.dropped(),
+            total,
+        });
     }
 
     if args.dry_run {
@@ -267,21 +305,44 @@ fn read_file(path: &Path) -> CliResult<Vec<u8>> {
     })
 }
 
+/// The directory the output lands in, or `None` when there is nothing to check.
+///
+/// `Path::parent` answers `Some("")` for a bare filename like `a.aib`, and an
+/// empty path exists nowhere - taking it at face value rejects every relative
+/// output. What it means is the working directory, which is already there.
+fn output_parent(output: &Path) -> Option<&Path> {
+    output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
 /// Sorted by name so two runs over the same backup print the same thing.
+///
+/// Counted per position in the extension table rather than per label, because
+/// two extensions can share a label and each entry belongs to whichever one it
+/// actually points at.
 fn entries_per_extension(backup: &Backup) -> BTreeMap<String, usize> {
-    let mut counts: BTreeMap<String, usize> = backup
+    let labels = report::labels(backup.extensions.iter().map(AsRef::as_ref));
+    let index: HashMap<&Arc<Extension>, usize> = backup
         .extensions
         .iter()
-        .map(|ext| (report::extension(ext), 0))
+        .enumerate()
+        .map(|(at, ext)| (ext, at))
         .collect();
 
+    let mut counts: Vec<usize> = vec![0; backup.extensions.len()];
     for entry in &backup.entries {
-        *counts
-            .entry(report::extension(&entry.extension))
-            .or_default() += 1;
+        // An entry whose extension is not in the table gets no row; `prune`
+        // reports that as a reader bug, and `inspect` never prunes.
+        if let Some(count) = index
+            .get(&entry.extension)
+            .and_then(|at| counts.get_mut(*at))
+        {
+            *count += 1;
+        }
     }
 
-    counts
+    labels.into_iter().zip(counts).collect()
 }
 
 #[cfg(test)]
@@ -385,6 +446,45 @@ mod tests {
         let counts = entries_per_extension(&backup);
         assert_eq!(counts.get("Used (en)"), Some(&2));
         assert_eq!(counts.get("Empty (en)"), Some(&0));
+    }
+
+    /// `-o a.aib` is the ordinary way to name an output, and its parent is the
+    /// empty path rather than `.`, which exists nowhere.
+    #[test]
+    fn a_bare_filename_has_no_parent_to_check() {
+        assert_eq!(output_parent(Path::new("a.aib")), None);
+        assert_eq!(
+            output_parent(Path::new("out/a.aib")),
+            Some(Path::new("out"))
+        );
+        assert_eq!(
+            output_parent(Path::new("/tmp/a.aib")),
+            Some(Path::new("/tmp"))
+        );
+    }
+
+    /// Tachiyomi's `backupSources` carries no language, so two sources of the
+    /// same app share a label; their entries belong to whichever one holds
+    /// them, and merging the rows would report both counts against one.
+    #[test]
+    fn extensions_sharing_a_label_keep_separate_rows() {
+        let first = extension("Comick");
+        let second = Arc::new(Extension {
+            external_id: "second".into(),
+            ..first.as_ref().clone()
+        });
+        let backup = Backup {
+            reader: Tachiyomi::ID,
+            version: None,
+            extensions: vec![Arc::clone(&first), Arc::clone(&second)],
+            entries: vec![manga("A", Arc::clone(&first)), manga("B", second)],
+            categories: Vec::new(),
+        };
+
+        let counts = entries_per_extension(&backup);
+        assert_eq!(counts.len(), 2, "the two Comicks merged into one row");
+        assert_eq!(counts.get("Comick (en) [Comick]"), Some(&1));
+        assert_eq!(counts.get("Comick (en) [second]"), Some(&1));
     }
 
     #[test]
