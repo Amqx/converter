@@ -91,12 +91,102 @@ macro_rules! quirks {
 /// is caught by `every_builtin_rule_parses` rather than at conversion time.
 pub const BUILTIN: &[SourceQuirk] = quirks! {
     from "tachiyomi" {
-        // `MangaDexHelper` builds both out of the API's uuids: `/manga/{id}`
-        // for an entry, `/chapter/{id}` for a chapter. Aidoku's
-        // `multi.mangadex` keys on the uuids themselves.
-        "multi.mangadex" {
-            manga: "/manga/{id}" => "{id}",
-            chapter: "/chapter/{id}" => "{id}",
+        // `SeriesDto.toSManga` keeps writing `/series/$slug` "for
+        // compatibility with existing bookmarks" long after the site moved to
+        // `/comics/`, and `ChapterDto.toSChapter` appends `/chapter/$number`.
+        // Aidoku's `helpers::get_manga_key` keeps only the slug and
+        // `get_chapter_key` only the number. Both sides already drop the
+        // eight-character random suffix the site puts on a series slug -
+        // Tachiyomi's `URL_RANDOM_PART`, Aidoku's `rfind('-')` - so the slug
+        // itself needs no further work. The `/manga/` form predates all of
+        // that and names the same slug.
+        "en.asurascans" {
+            manga: ["/series/{slug}", "/manga/{slug}/"] => "{slug}",
+            chapter: "/series/{slug}/chapter/{number}" => "{number}",
+        }
+
+        // `ChapterDto.toSChapter` writes `"$slug/$id"` so `pageListRequest`
+        // can split the manga back out of it; Aidoku's `into_chapter` is
+        // handed the manga key separately and stores the chapter id alone.
+        // The entry id is the same document id on both sides.
+        "en.atsumaru" {
+            chapter: "{manga}/{chapter}" => "{chapter}",
+        }
+
+        // Comix's ids are the leading segment of a slug: `getMangaUrl` builds
+        // `$baseUrl/title$url` out of `/{hid}-{title}` and `getChapterUrl`
+        // `$baseUrl/$url` out of `title/{hid}-{title}/{id}-chapter-{number}`,
+        // while Aidoku keys on `ComixManga.hid` and `ComixChapter.id` - the
+        // same two ids, without the title that follows them.
+        "en.comix" {
+            manga: "/{id}-{slug}" => "{id}",
+            chapter: [
+                "title/{series}-{slug}/{id}-chapter-{number}",
+                // A chapter the site named nothing after its id.
+                "title/{series}-{slug}/{id}",
+            ] => "{id}",
+        }
+
+        // Iken's `MangaDto.toSManga` writes `"$slug#$id"` and
+        // `ChapterDto.toSChapter` `"/series/$seriesSlug/$slug#$id"`, carrying
+        // the numeric ids in the fragment because the slugs are what the site
+        // shows. Aidoku's `parse_basic_manga` and `IkenChapter::parse_chapter`
+        // key on those ids alone, since `/api/post?postId=` and
+        // `/api/chapter?chapterId=` are what the api takes.
+        "en.hivescans" {
+            manga: "{slug}#{id}" => "{id}",
+            chapter: "/series/{series}/{slug}#{id}" => "{id}",
+        }
+
+        "en.magusmanga" {
+            manga: "{slug}#{id}" => "{id}",
+            chapter: "/series/{series}/{slug}#{id}" => "{id}",
+        }
+
+        // The mangabox sources below key on a site-relative path, which is
+        // what Tachiyomi's `setUrlWithoutDomain` stores too - until the site
+        // moved and the old host stayed in the library. Aidoku's `MangaBox`
+        // pastes `params.base_url` in front of the key, so an absolute id
+        // becomes two urls end to end. Stripping the current host fixes the
+        // rows that moved with it; the ids left over name predecessor sites
+        // whose slugs the new one does not serve, and those are dropped.
+        "en.mangabat" {
+            chapter: [
+                "https://www.mangabats.com/manga/{slug}/{chapter}",
+                "/manga/{slug}/{chapter}",
+            ] => "/manga/{slug}/{chapter}",
+        }
+
+        "en.mangakakalot" {
+            manga: "/manga/{slug}" => "/manga/{slug}",
+            chapter: [
+                "https://www.mangakakalot.gg/manga/{slug}/{chapter}",
+                "/manga/{slug}/{chapter}",
+            ] => "/manga/{slug}/{chapter}",
+        }
+
+        "en.manganato" {
+            manga: "/manga/{slug}" => "/manga/{slug}",
+            chapter: "/manga/{slug}/{chapter}" => "/manga/{slug}/{chapter}",
+        }
+
+        // E-Hentai is the one source here whose key is a whole url:
+        // `EHGalleryItem::into_basic_manga` stores what `get_base_url` built,
+        // and `rewrite_domain` swaps the host for whichever of the two sites
+        // the reader is set to - so the gallery id and token are the part
+        // that matters and `e-hentai.org` is only a spelling. Tachiyomi keeps
+        // the path with the `?nw=always` that skips the content warning.
+        // ExHentai shares both ids, and one rule covers it because rules are
+        // keyed by the Aidoku source the two of them resolve to.
+        "multi.ehentai" {
+            manga: [
+                "/g/{gid}/{token}/?nw=always",
+                "/g/{gid}/{token}/",
+            ] => "https://e-hentai.org/g/{gid}/{token}/",
+            chapter: [
+                "/g/{gid}/{token}/?nw=always",
+                "/g/{gid}/{token}/",
+            ] => "https://e-hentai.org/g/{gid}/{token}/",
         }
 
         // Kagane agrees on the entry as it stands - `SeriesDto.toSManga`
@@ -115,6 +205,38 @@ pub const BUILTIN: &[SourceQuirk] = quirks! {
                 "{series};{book};{pages}",
                 "{series};{book}",
             ] => "{book}",
+        }
+
+        // `MangaDexHelper` builds both out of the API's uuids: `/manga/{id}`
+        // for an entry, `/chapter/{id}` for a chapter. Aidoku's
+        // `multi.mangadex` keys on the uuids themselves.
+        "multi.mangadex" {
+            manga: "/manga/{id}" => "{id}",
+            chapter: "/chapter/{id}" => "{id}",
+        }
+
+        // Aidoku keys on the api's own two ids - `hid` for a title, the
+        // numeric `id` for a chapter - and `get_manga_update` refuses a key
+        // starting `/manga` outright ("Migrate this title to update
+        // details."). Tachiyomi spells the title `/title/$hid-$slug` and the
+        // chapter `$mangaUrl/$id-chapter-$number-$lang`; the `/manga/` and
+        // `/read/` forms are older and the app never rewrote them, so one
+        // library holds all three. `/read/` is the one that carries no
+        // chapter id at all, and those rows are dropped.
+        "multi.mangafire" {
+            manga: ["/manga/{slug}.{id}", "/title/{id}-{slug}"] => "{id}",
+            chapter: [
+                "/manga/{slug}.{hid}/{id}-chapter-{number}",
+                "/title/{hid}-{slug}/{id}-chapter-{number}",
+            ] => "{id}",
+        }
+
+        // Both of nhentai's keys are the gallery id: Aidoku's `Gallery`
+        // conversion stores `value.id` and rebuilds `/g/{id}` when it needs
+        // the url, where Tachiyomi keeps the path it read.
+        "multi.nhentai" {
+            manga: "/g/{id}/" => "{id}",
+            chapter: "/g/{id}/" => "{id}",
         }
     }
 };
@@ -444,6 +566,108 @@ mod tests {
         // series in front of it.
         assert_eq!(book("01JQ8;01JQ9;78"), expected);
         assert_eq!(book("01JQ8;01JQ9"), expected);
+    }
+
+    /// Iken carries the ids Aidoku wants in the fragment of a slug, and both
+    /// fields spell it the same way.
+    #[test]
+    fn iken_ids_come_out_of_the_fragment() {
+        let quirks = Quirks::compile(BUILTIN, TACHI);
+
+        for source in ["en.hivescans", "en.magusmanga"] {
+            let rules = quirks.get(source).expect("a rule for an Iken source");
+            assert_eq!(
+                rules.manga_id("eleceed#12"),
+                Rewritten::Into("12".to_string())
+            );
+            assert_eq!(
+                rules.chapter_id("/series/eleceed/chapter-413#20565"),
+                Rewritten::Into("20565".to_string())
+            );
+        }
+    }
+
+    /// The mangabox sources key on a path, and `MangaBox` pastes its own base
+    /// url in front of it - so an id that kept the host has to lose it.
+    #[test]
+    fn a_mangabox_id_that_kept_its_host_loses_it_again() {
+        let quirks = Quirks::compile(BUILTIN, TACHI);
+        let rules = quirks
+            .get("en.mangakakalot")
+            .expect("a rule for MangaKakalot");
+
+        let expected = Rewritten::Into("/manga/this-witch-of-mine/chapter-1".to_string());
+        assert_eq!(
+            rules.chapter_id("https://www.mangakakalot.gg/manga/this-witch-of-mine/chapter-1"),
+            expected
+        );
+        assert_eq!(
+            rules.chapter_id("/manga/this-witch-of-mine/chapter-1"),
+            expected
+        );
+
+        // The predecessor sites' ids name slugs mangakakalot.gg does not
+        // serve, so there is nothing to write them as.
+        assert_eq!(
+            rules.chapter_id("https://chapmanganato.com/manga-as956575/chapter-1"),
+            Rewritten::NoMatch
+        );
+        assert_eq!(
+            rules.manga_id("/read-ax0zw158504916009"),
+            Rewritten::NoMatch
+        );
+    }
+
+    /// E-Hentai's key is a whole url, so this rule builds one rather than
+    /// stripping one. `ExHentai` resolves to the same Aidoku source and shares
+    /// the gallery ids, which is why one rule covers both.
+    #[test]
+    fn ehentai_ids_become_the_url_aidoku_keys_on() {
+        let quirks = Quirks::compile(BUILTIN, TACHI);
+        let rules = quirks.get("multi.ehentai").expect("a rule for E-Hentai");
+
+        let expected = Rewritten::Into("https://e-hentai.org/g/3611504/4f60ad8178/".to_string());
+        assert_eq!(rules.manga_id("/g/3611504/4f60ad8178/?nw=always"), expected);
+        assert_eq!(rules.chapter_id("/g/3611504/4f60ad8178/"), expected);
+    }
+
+    /// `MangaFire` has respelled the entry twice and the chapter once, and only
+    /// the newer chapter spelling carries the id Aidoku keys on.
+    #[test]
+    fn mangafire_keeps_the_ids_its_api_takes() {
+        let quirks = Quirks::compile(BUILTIN, TACHI);
+        let rules = quirks.get("multi.mangafire").expect("a rule for MangaFire");
+
+        let hid = Rewritten::Into("yko70".to_string());
+        assert_eq!(rules.manga_id("/manga/a-stepmothers-marchenn.yko70"), hid);
+        assert_eq!(rules.manga_id("/title/yko70-a-stepmothers-marchenn"), hid);
+
+        assert_eq!(
+            rules.chapter_id("/manga/a-stepmothers-marchenn.yko70/5910205-chapter-77.5-en"),
+            Rewritten::Into("5910205".to_string())
+        );
+        // The `/read/` spelling names the chapter by number, and the number
+        // is not the id.
+        assert_eq!(
+            rules.chapter_id("/read/daemabeopsaui-ttall.4j8jx/en/chapter-0"),
+            Rewritten::NoMatch
+        );
+    }
+
+    /// Asura kept `/series/` in the backup after the site moved to `/comics/`,
+    /// and the chapter is numbered rather than slugged.
+    #[test]
+    fn asura_ids_lose_the_path_around_them() {
+        let quirks = Quirks::compile(BUILTIN, TACHI);
+        let rules = quirks.get("en.asurascans").expect("a rule for Asura Scans");
+
+        let slug = Rewritten::Into("nano-machine".to_string());
+        assert_eq!(rules.manga_id("/series/nano-machine"), slug);
+        assert_eq!(rules.manga_id("/manga/nano-machine/"), slug);
+        assert_eq!(
+            rules.chapter_id("/series/nano-machine/chapter/283"),
+            Rewritten::Into("283".to_string())
+        );
     }
 
     /// The shape a rule was written for is the only one it claims to know.
